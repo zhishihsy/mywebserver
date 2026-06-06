@@ -7,11 +7,9 @@
 #include <unistd.h>
 
 #include <cerrno>
-#include <cstring>
 #include <iostream>
 
 namespace {
-constexpr int kBufferSize = 1024;
 constexpr int kMaxEventNumber = 10000;
 constexpr int kListenBacklog = 5;
 }  // namespace
@@ -199,7 +197,8 @@ bool WebServer::acceptConnectionLT() {
     setsockopt(client_fd, SOL_SOCKET, SO_LINGER, &option, sizeof(option));
   }
 
-  clients_[client_fd] = {client_address, client_fd};
+  clients_.emplace(client_fd,
+                   ClientData{client_address, client_fd, HttpConnection()});
 
   // 客户端连接使用 EPOLLONESHOT，避免同一连接被重复处理。
   addFd(epoll_fd_, client_fd, true, connect_trig_mode_);
@@ -233,7 +232,8 @@ bool WebServer::acceptConnectionET() {
                  sizeof(option));
     }
 
-    clients_[client_fd] = {client_address, client_fd};
+    clients_.emplace(client_fd,
+                     ClientData{client_address, client_fd, HttpConnection()});
     addFd(epoll_fd_, client_fd, true, connect_trig_mode_);
 
     std::cout << "New connection (fd: " << client_fd << ")"
@@ -242,88 +242,47 @@ bool WebServer::acceptConnectionET() {
 }
 
 bool WebServer::dealwithread(int sockfd) {
-  bool success =
-      connect_trig_mode_ == 1 ? readET(sockfd) : readLT(sockfd);
-
-  if (success) {
-    // 本阶段读取请求后直接切换到写事件，返回固定响应。
-    modFd(epoll_fd_, sockfd, EPOLLOUT, connect_trig_mode_);
+  auto client = clients_.find(sockfd);
+  if (client == clients_.end()) {
+    return false;
   }
 
-  return success;
+  HttpConnection::ReadResult result =
+      client->second.connection.readFromSocket(sockfd,
+                                               connect_trig_mode_ == 1);
+  if (result == HttpConnection::ReadResult::kNeedMoreData) {
+    modFd(epoll_fd_, sockfd, EPOLLIN, connect_trig_mode_);
+    return true;
+  }
+  if (result == HttpConnection::ReadResult::kResponseReady) {
+    modFd(epoll_fd_, sockfd, EPOLLOUT, connect_trig_mode_);
+    return true;
+  }
+
+  closeClient(sockfd);
+  return false;
 }
 
 bool WebServer::dealwithwrite(int sockfd) {
-  // 当前阶段使用固定响应验证读写事件切换。
-  const char response[] =
-      "HTTP/1.1 200 OK\r\n"
-      "Content-Length: 5\r\n"
-      "\r\n"
-      "Hello";
-
-  ssize_t bytes_sent = send(sockfd, response, sizeof(response) - 1, 0);
-  if (bytes_sent < 0) {
-    closeClient(sockfd);
+  auto client = clients_.find(sockfd);
+  if (client == clients_.end()) {
     return false;
   }
 
-  // EPOLLONESHOT 事件处理完毕后，需要重新注册下一次读事件。
-  modFd(epoll_fd_, sockfd, EPOLLIN, connect_trig_mode_);
-  return true;
-}
-
-bool WebServer::readLT(int sockfd) {
-  char buffer[kBufferSize]{};
-  ssize_t bytes_read = recv(sockfd, buffer, sizeof(buffer) - 1, 0);
-
-  if (bytes_read < 0) {
-    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-      return true;
-    }
-
-    std::cerr << "LT read error" << std::endl;
-    closeClient(sockfd);
-    return false;
+  HttpConnection::WriteResult result =
+      client->second.connection.writeToSocket(sockfd);
+  if (result == HttpConnection::WriteResult::kWantRead) {
+    modFd(epoll_fd_, sockfd, EPOLLIN, connect_trig_mode_);
+    return true;
+  }
+  if (result == HttpConnection::WriteResult::kWantWrite) {
+    modFd(epoll_fd_, sockfd, EPOLLOUT, connect_trig_mode_);
+    return true;
   }
 
-  // recv 返回 0 表示对端已经正常关闭连接。
-  if (bytes_read == 0) {
-    closeClient(sockfd);
-    return false;
-  }
-
-  std::cout << "LT received " << bytes_read << " bytes: " << buffer
-            << std::endl;
-  return true;
-}
-
-bool WebServer::readET(int sockfd) {
-  char buffer[kBufferSize];
-
-  // ET 模式必须一次性读空接收缓冲区，
-  // recv 返回 EAGAIN 时才表示本轮读取完成。
-  while (true) {
-    std::memset(buffer, 0, sizeof(buffer));
-    ssize_t bytes_read = recv(sockfd, buffer, sizeof(buffer) - 1, 0);
-
-    if (bytes_read < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        return true;
-      }
-
-      std::cerr << "ET read error" << std::endl;
-      closeClient(sockfd);
-      return false;
-    }
-
-    if (bytes_read == 0) {
-      closeClient(sockfd);
-      return false;
-    }
-
-    std::cout << "ET received " << bytes_read << " bytes: " << buffer
-              << std::endl;
-  }
+  bool clean_close = result == HttpConnection::WriteResult::kClose;
+  closeClient(sockfd);
+  return clean_close;
 }
 
 void WebServer::closeClient(int sockfd) {

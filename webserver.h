@@ -1,6 +1,8 @@
 #ifndef WEBSERVER_H
 #define WEBSERVER_H
 
+#include "http_connection.h"
+
 #include <netinet/in.h>
 
 #include <map>
@@ -27,6 +29,7 @@ class WebServer {
   struct ClientData {
     sockaddr_in address;
     int sockfd;
+    HttpConnection connection;
   };
 
   // 根据监听 socket 的触发模式接收新连接。
@@ -37,8 +40,6 @@ class WebServer {
   // 处理客户端 socket 的可读、可写事件。
   bool dealwithread(int sockfd);
   bool dealwithwrite(int sockfd);
-  bool readLT(int sockfd);
-  bool readET(int sockfd);
 
   // 从 epoll 和客户端表中移除连接，并关闭 socket。
   void closeClient(int sockfd);

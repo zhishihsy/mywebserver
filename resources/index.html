@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tiny WebServer</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      min-height: 100vh;
+      margin: 0;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      color: #e8edf5;
+      background:
+        radial-gradient(circle at top, #203458 0, transparent 42%),
+        #0b1020;
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(100%, 620px);
+      padding: 48px;
+      border: 1px solid #334365;
+      border-radius: 20px;
+      background: rgba(19, 28, 49, 0.88);
+      box-shadow: 0 24px 70px rgba(0, 0, 0, 0.35);
+    }
+
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: #88efbb;
+      font-weight: 600;
+    }
+
+    .status::before {
+      width: 10px;
+      height: 10px;
+      content: "";
+      border-radius: 50%;
+      background: #43d68a;
+      box-shadow: 0 0 14px #43d68a;
+    }
+
+    h1 {
+      margin: 18px 0 12px;
+      font-size: clamp(2.4rem, 8vw, 4.5rem);
+      line-height: 1;
+    }
+
+    p {
+      margin: 0 0 30px;
+      color: #aebbd1;
+      font-size: 1.1rem;
+      line-height: 1.7;
+    }
+
+    a {
+      display: inline-block;
+      padding: 12px 18px;
+      border-radius: 10px;
+      color: #08111f;
+      background: #70a7ff;
+      font-weight: 700;
+      text-decoration: none;
+    }
+
+    a:hover {
+      background: #94bdff;
+    }
+
+    code {
+      color: #bdd4ff;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="status">服务运行中</div>
+    <h1>Tiny WebServer</h1>
+    <p>
+      你的 C++ Web 服务器已经成功返回静态页面。
+      可以访问 <code>/health</code> 检查服务状态。
+    </p>
+    <a href="/health">检查服务状态</a>
+  </main>
+</body>
+</html>
