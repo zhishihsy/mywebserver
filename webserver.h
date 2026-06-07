@@ -2,10 +2,15 @@
 #define WEBSERVER_H
 
 #include "http_connection.h"
+#include "thread_pool.h"
 
 #include <netinet/in.h>
 
+#include <atomic>
+#include <cstdint>
 #include <map>
+#include <memory>
+#include <mutex>
 
 class WebServer {
  public:
@@ -27,22 +32,27 @@ class WebServer {
  private:
   // 保存一个客户端连接对应的地址和文件描述符。
   struct ClientData {
-    sockaddr_in address;
-    int sockfd;
+    sockaddr_in address{};
+    int sockfd{-1};
     HttpConnection connection;
+    std::atomic<bool> closed{false};
   };
+
+  using ClientPtr = std::shared_ptr<ClientData>;
 
   // 根据监听 socket 的触发模式接收新连接。
   bool dealclinetdata();
   bool acceptConnectionLT();
   bool acceptConnectionET();
 
-  // 处理客户端 socket 的可读、可写事件。
-  bool dealwithread(int sockfd);
-  bool dealwithwrite(int sockfd);
+  // 将客户端事件交给线程池，并在工作线程中处理读写。
+  ClientPtr findClient(int sockfd);
+  bool dispatchClientEvent(const ClientPtr& client, uint32_t event);
+  bool dealwithread(const ClientPtr& client);
+  bool dealwithwrite(const ClientPtr& client);
 
   // 从 epoll 和客户端表中移除连接，并关闭 socket。
-  void closeClient(int sockfd);
+  void closeClient(const ClientPtr& client);
 
   // epoll 文件描述符操作辅助函数。
   static int setNonblocking(int fd);
@@ -62,7 +72,9 @@ class WebServer {
   int epoll_fd_;
 
   // 以客户端 socket 为键保存连接信息。
-  std::map<int, ClientData> clients_;
+  ThreadPool thread_pool_;
+  std::mutex clients_mutex_;
+  std::map<int, ClientPtr> clients_;
 };
 
 #endif

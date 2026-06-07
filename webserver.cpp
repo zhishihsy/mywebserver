@@ -24,9 +24,19 @@ WebServer::WebServer()
       epoll_fd_(-1) {}
 
 WebServer::~WebServer() {
+  thread_pool_.shutdown();
+
   // 先关闭所有客户端，再释放监听 socket 和 epoll。
-  while (!clients_.empty()) {
-    closeClient(clients_.begin()->first);
+  while (true) {
+    ClientPtr client;
+    {
+      std::lock_guard<std::mutex> lock(clients_mutex_);
+      if (clients_.empty()) {
+        break;
+      }
+      client = clients_.begin()->second;
+    }
+    closeClient(client);
   }
 
   if (listen_fd_ >= 0) {
@@ -155,17 +165,13 @@ void WebServer::eventLoop() {
       if (sockfd == listen_fd_) {
         // 监听 socket 可读，说明有新连接到达。
         dealclinetdata();
-      } else if (event & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
-        // 对端关闭连接或 socket 出现异常。
-        std::cout << "Connection closed (fd: " << sockfd << ")"
-                  << std::endl;
-        closeClient(sockfd);
-      } else if (event & EPOLLIN) {
-        // 客户端数据到达。
-        dealwithread(sockfd);
-      } else if (event & EPOLLOUT) {
-        // 客户端 socket 当前可写。
-        dealwithwrite(sockfd);
+      } else {
+        ClientPtr client = findClient(sockfd);
+        if (client && !dispatchClientEvent(client, event)) {
+          std::cerr << "Warning: worker queue is full, closing fd: "
+                    << sockfd << std::endl;
+          closeClient(client);
+        }
       }
     }
   }
@@ -197,8 +203,13 @@ bool WebServer::acceptConnectionLT() {
     setsockopt(client_fd, SOL_SOCKET, SO_LINGER, &option, sizeof(option));
   }
 
-  clients_.emplace(client_fd,
-                   ClientData{client_address, client_fd, HttpConnection()});
+  ClientPtr client = std::make_shared<ClientData>();
+  client->address = client_address;
+  client->sockfd = client_fd;
+  {
+    std::lock_guard<std::mutex> lock(clients_mutex_);
+    clients_.emplace(client_fd, client);
+  }
 
   // 客户端连接使用 EPOLLONESHOT，避免同一连接被重复处理。
   addFd(epoll_fd_, client_fd, true, connect_trig_mode_);
@@ -232,8 +243,13 @@ bool WebServer::acceptConnectionET() {
                  sizeof(option));
     }
 
-    clients_.emplace(client_fd,
-                     ClientData{client_address, client_fd, HttpConnection()});
+    ClientPtr client = std::make_shared<ClientData>();
+    client->address = client_address;
+    client->sockfd = client_fd;
+    {
+      std::lock_guard<std::mutex> lock(clients_mutex_);
+      clients_.emplace(client_fd, client);
+    }
     addFd(epoll_fd_, client_fd, true, connect_trig_mode_);
 
     std::cout << "New connection (fd: " << client_fd << ")"
@@ -241,15 +257,42 @@ bool WebServer::acceptConnectionET() {
   }
 }
 
-bool WebServer::dealwithread(int sockfd) {
+WebServer::ClientPtr WebServer::findClient(int sockfd) {
+  std::lock_guard<std::mutex> lock(clients_mutex_);
   auto client = clients_.find(sockfd);
   if (client == clients_.end()) {
+    return nullptr;
+  }
+  return client->second;
+}
+
+bool WebServer::dispatchClientEvent(const ClientPtr& client,
+                                    uint32_t event) {
+  return thread_pool_.enqueue([this, client, event] {
+    if (client->closed.load()) {
+      return;
+    }
+
+    if (event & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
+      std::cout << "Connection closed (fd: " << client->sockfd << ")"
+                << std::endl;
+      closeClient(client);
+    } else if (event & EPOLLIN) {
+      dealwithread(client);
+    } else if (event & EPOLLOUT) {
+      dealwithwrite(client);
+    }
+  });
+}
+
+bool WebServer::dealwithread(const ClientPtr& client) {
+  if (!client || client->closed.load()) {
     return false;
   }
 
+  int sockfd = client->sockfd;
   HttpConnection::ReadResult result =
-      client->second.connection.readFromSocket(sockfd,
-                                               connect_trig_mode_ == 1);
+      client->connection.readFromSocket(sockfd, connect_trig_mode_ == 1);
   if (result == HttpConnection::ReadResult::kNeedMoreData) {
     modFd(epoll_fd_, sockfd, EPOLLIN, connect_trig_mode_);
     return true;
@@ -259,18 +302,18 @@ bool WebServer::dealwithread(int sockfd) {
     return true;
   }
 
-  closeClient(sockfd);
+  closeClient(client);
   return false;
 }
 
-bool WebServer::dealwithwrite(int sockfd) {
-  auto client = clients_.find(sockfd);
-  if (client == clients_.end()) {
+bool WebServer::dealwithwrite(const ClientPtr& client) {
+  if (!client || client->closed.load()) {
     return false;
   }
 
+  int sockfd = client->sockfd;
   HttpConnection::WriteResult result =
-      client->second.connection.writeToSocket(sockfd);
+      client->connection.writeToSocket(sockfd);
   if (result == HttpConnection::WriteResult::kWantRead) {
     modFd(epoll_fd_, sockfd, EPOLLIN, connect_trig_mode_);
     return true;
@@ -281,13 +324,24 @@ bool WebServer::dealwithwrite(int sockfd) {
   }
 
   bool clean_close = result == HttpConnection::WriteResult::kClose;
-  closeClient(sockfd);
+  closeClient(client);
   return clean_close;
 }
 
-void WebServer::closeClient(int sockfd) {
-  clients_.erase(sockfd);
-  removeFd(epoll_fd_, sockfd);
+void WebServer::closeClient(const ClientPtr& client) {
+  if (!client || client->closed.exchange(true)) {
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(clients_mutex_);
+    auto current = clients_.find(client->sockfd);
+    if (current != clients_.end() && current->second == client) {
+      clients_.erase(current);
+    }
+  }
+
+  removeFd(epoll_fd_, client->sockfd);
 }
 
 int WebServer::setNonblocking(int fd) {
