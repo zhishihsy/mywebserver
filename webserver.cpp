@@ -6,12 +6,14 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
+#include <climits>
 #include <iostream>
 
 namespace {
 constexpr int kMaxEventNumber = 10000;
-constexpr int kListenBacklog = 5;
+constexpr int kListenBacklog = SOMAXCONN;
 }  // namespace
 
 WebServer::WebServer()
@@ -20,6 +22,7 @@ WebServer::WebServer()
       listen_trig_mode_(0),
       connect_trig_mode_(0),
       linger_option_(0),
+      idle_timeout_(std::chrono::seconds(60)),
       listen_fd_(-1),
       epoll_fd_(-1) {}
 
@@ -48,10 +51,13 @@ WebServer::~WebServer() {
   }
 }
 
-void WebServer::init(int port, int trig_mode, int linger_option) {
+void WebServer::init(int port, int trig_mode, int linger_option,
+                     int idle_timeout_seconds) {
   port_ = port;
   trig_mode_ = trig_mode;
   linger_option_ = linger_option;
+  idle_timeout_ =
+      std::chrono::seconds(std::max(1, idle_timeout_seconds));
 }
 
 void WebServer::trig_mode() {
@@ -143,11 +149,16 @@ void WebServer::eventLoop() {
             << (listen_trig_mode_ ? "ET" : "LT") << std::endl;
   std::cout << " > Connect Mode: "
             << (connect_trig_mode_ ? "ET" : "LT") << std::endl;
+  std::cout << " > Idle Timeout: " << idle_timeout_.count() / 1000
+            << "s" << std::endl;
 
   while (true) {
-    // 阻塞等待事件；被信号中断时继续等待。
+    expireIdleConnections();
+
+    // 最多等待到最近一个连接到期，之后执行超时清理。
     int event_count =
-        epoll_wait(epoll_fd_, events, kMaxEventNumber, -1);
+        epoll_wait(epoll_fd_, events, kMaxEventNumber,
+                   nextTimerTimeout());
 
     if (event_count < 0) {
       if (errno == EINTR) {
@@ -213,6 +224,7 @@ bool WebServer::acceptConnectionLT() {
 
   // 客户端连接使用 EPOLLONESHOT，避免同一连接被重复处理。
   addFd(epoll_fd_, client_fd, true, connect_trig_mode_);
+  refreshTimer(client);
 
   std::cout << "New connection (fd: " << client_fd << ")" << std::endl;
   return true;
@@ -251,6 +263,7 @@ bool WebServer::acceptConnectionET() {
       clients_.emplace(client_fd, client);
     }
     addFd(epoll_fd_, client_fd, true, connect_trig_mode_);
+    refreshTimer(client);
 
     std::cout << "New connection (fd: " << client_fd << ")"
               << std::endl;
@@ -268,70 +281,169 @@ WebServer::ClientPtr WebServer::findClient(int sockfd) {
 
 bool WebServer::dispatchClientEvent(const ClientPtr& client,
                                     uint32_t event) {
-  return thread_pool_.enqueue([this, client, event] {
+  bool expected = false;
+  if (!client->busy.compare_exchange_strong(expected, true)) {
+    return true;
+  }
+
+  refreshTimer(client);
+  bool enqueued = thread_pool_.enqueue([this, client, event] {
     if (client->closed.load()) {
+      client->busy.store(false);
       return;
     }
 
+    ClientAction action = ClientAction::kClose;
     if (event & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
       std::cout << "Connection closed (fd: " << client->sockfd << ")"
                 << std::endl;
-      closeClient(client);
     } else if (event & EPOLLIN) {
-      dealwithread(client);
+      action = dealwithread(client);
     } else if (event & EPOLLOUT) {
-      dealwithwrite(client);
+      action = dealwithwrite(client);
+    }
+
+    if (action == ClientAction::kClose) {
+      closeClient(client);
+      client->busy.store(false);
+      return;
+    }
+
+    refreshTimer(client);
+    client->busy.store(false);
+
+    // 重新激活 EPOLLONESHOT 必须是任务的最后一步。
+    if (!client->closed.load()) {
+      int next_event = action == ClientAction::kWaitForRead
+                           ? EPOLLIN
+                           : EPOLLOUT;
+      modFd(epoll_fd_, client->sockfd, next_event, connect_trig_mode_);
     }
   });
+
+  if (!enqueued) {
+    client->busy.store(false);
+  }
+  return enqueued;
 }
 
-bool WebServer::dealwithread(const ClientPtr& client) {
+WebServer::ClientAction WebServer::dealwithread(
+    const ClientPtr& client) {
   if (!client || client->closed.load()) {
-    return false;
+    return ClientAction::kClose;
   }
 
   int sockfd = client->sockfd;
   HttpConnection::ReadResult result =
       client->connection.readFromSocket(sockfd, connect_trig_mode_ == 1);
   if (result == HttpConnection::ReadResult::kNeedMoreData) {
-    modFd(epoll_fd_, sockfd, EPOLLIN, connect_trig_mode_);
-    return true;
+    return ClientAction::kWaitForRead;
   }
   if (result == HttpConnection::ReadResult::kResponseReady) {
-    modFd(epoll_fd_, sockfd, EPOLLOUT, connect_trig_mode_);
-    return true;
+    return ClientAction::kWaitForWrite;
   }
 
-  closeClient(client);
-  return false;
+  return ClientAction::kClose;
 }
 
-bool WebServer::dealwithwrite(const ClientPtr& client) {
+WebServer::ClientAction WebServer::dealwithwrite(
+    const ClientPtr& client) {
   if (!client || client->closed.load()) {
-    return false;
+    return ClientAction::kClose;
   }
 
   int sockfd = client->sockfd;
   HttpConnection::WriteResult result =
       client->connection.writeToSocket(sockfd);
   if (result == HttpConnection::WriteResult::kWantRead) {
-    modFd(epoll_fd_, sockfd, EPOLLIN, connect_trig_mode_);
-    return true;
+    return ClientAction::kWaitForRead;
   }
   if (result == HttpConnection::WriteResult::kWantWrite) {
-    modFd(epoll_fd_, sockfd, EPOLLOUT, connect_trig_mode_);
-    return true;
+    return ClientAction::kWaitForWrite;
   }
 
-  bool clean_close = result == HttpConnection::WriteResult::kClose;
-  closeClient(client);
-  return clean_close;
+  return ClientAction::kClose;
+}
+
+void WebServer::refreshTimer(const ClientPtr& client) {
+  if (!client || client->closed.load()) {
+    return;
+  }
+
+  uint64_t generation = client->timer_generation.fetch_add(1) + 1;
+  TimerEntry entry{Clock::now() + idle_timeout_, client, generation};
+
+  std::lock_guard<std::mutex> lock(timers_mutex_);
+  timers_.push(std::move(entry));
+}
+
+void WebServer::expireIdleConnections() {
+  std::vector<ClientPtr> expired_clients;
+
+  {
+    std::lock_guard<std::mutex> lock(timers_mutex_);
+    Clock::time_point now = Clock::now();
+
+    while (!timers_.empty() && timers_.top().expires_at <= now) {
+      TimerEntry entry = timers_.top();
+      timers_.pop();
+
+      ClientPtr client = entry.client.lock();
+      if (!client || client->closed.load() ||
+          client->timer_generation.load() != entry.generation) {
+        continue;
+      }
+
+      bool expected = false;
+      if (!client->busy.compare_exchange_strong(expected, true)) {
+        uint64_t generation =
+            client->timer_generation.fetch_add(1) + 1;
+        timers_.push(
+            TimerEntry{now + idle_timeout_, client, generation});
+        continue;
+      }
+
+      expired_clients.push_back(std::move(client));
+    }
+  }
+
+  for (const ClientPtr& client : expired_clients) {
+    std::cout << "Idle connection timed out (fd: " << client->sockfd
+              << ")" << std::endl;
+    closeClient(client);
+  }
+}
+
+int WebServer::nextTimerTimeout() {
+  std::lock_guard<std::mutex> lock(timers_mutex_);
+
+  while (!timers_.empty()) {
+    const TimerEntry& entry = timers_.top();
+    ClientPtr client = entry.client.lock();
+    if (!client || client->closed.load() ||
+        client->timer_generation.load() != entry.generation) {
+      timers_.pop();
+      continue;
+    }
+
+    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        entry.expires_at - Clock::now());
+    if (remaining.count() <= 0) {
+      return 0;
+    }
+    return static_cast<int>(
+        std::min<int64_t>(remaining.count(), INT_MAX));
+  }
+
+  return -1;
 }
 
 void WebServer::closeClient(const ClientPtr& client) {
   if (!client || client->closed.exchange(true)) {
     return;
   }
+
+  client->timer_generation.fetch_add(1);
 
   {
     std::lock_guard<std::mutex> lock(clients_mutex_);
