@@ -1,19 +1,37 @@
 #include "http_connection.h"
 
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/uio.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
 #include <cctype>
 #include <filesystem>
-#include <fstream>
-#include <iterator>
+#include <limits>
 #include <sstream>
 
 namespace {
 constexpr std::size_t kReadChunkSize = 4096;
-constexpr std::size_t kMaxRequestSize = 64 * 1024;
+constexpr std::size_t kMaxHeaderSize = 64 * 1024;
+constexpr std::size_t kMaxBodySize = 1024 * 1024;
+constexpr std::size_t kMaxBufferedSize = kMaxHeaderSize + kMaxBodySize;
 const char kDocumentRoot[] = "resources";
+
+bool pathIsWithin(const std::filesystem::path& root,
+                  const std::filesystem::path& candidate) {
+  auto root_part = root.begin();
+  auto candidate_part = candidate.begin();
+  for (; root_part != root.end(); ++root_part, ++candidate_part) {
+    if (candidate_part == candidate.end() || *root_part != *candidate_part) {
+      return false;
+    }
+  }
+  return true;
+}
 }  // namespace
 
 HttpConnection::HttpConnection()
@@ -21,17 +39,25 @@ HttpConnection::HttpConnection()
       parse_position_(0),
       content_length_(0),
       bytes_written_(0),
+      mapped_file_(nullptr),
+      mapped_file_size_(0),
       keep_alive_(false) {}
+
+HttpConnection::~HttpConnection() {
+  releaseMappedFile();
+}
 
 HttpConnection::ReadResult HttpConnection::readFromSocket(
     int sockfd, bool edge_triggered) {
   char buffer[kReadChunkSize];
+  bool peer_closed = false;
 
   while (true) {
     ssize_t bytes_read = recv(sockfd, buffer, sizeof(buffer), 0);
     if (bytes_read > 0) {
       read_buffer_.append(buffer, static_cast<std::size_t>(bytes_read));
-      if (read_buffer_.size() > kMaxRequestSize) {
+      if (read_buffer_.size() > kMaxBufferedSize) {
+        keep_alive_ = false;
         buildErrorResponse(413, "Payload Too Large", "Request is too large.");
         return ReadResult::kResponseReady;
       }
@@ -42,7 +68,8 @@ HttpConnection::ReadResult HttpConnection::readFromSocket(
     }
 
     if (bytes_read == 0) {
-      return ReadResult::kPeerClosed;
+      peer_closed = true;
+      break;
     }
     if (errno == EINTR) {
       continue;
@@ -55,7 +82,7 @@ HttpConnection::ReadResult HttpConnection::readFromSocket(
 
   ParseResult result = parseRequest();
   if (result == ParseResult::kIncomplete) {
-    return ReadResult::kNeedMoreData;
+    return peer_closed ? ReadResult::kPeerClosed : ReadResult::kNeedMoreData;
   }
   if (result == ParseResult::kBadRequest) {
     keep_alive_ = false;
@@ -70,10 +97,30 @@ HttpConnection::ReadResult HttpConnection::readFromSocket(
 }
 
 HttpConnection::WriteResult HttpConnection::writeToSocket(int sockfd) {
-  while (bytes_written_ < write_buffer_.size()) {
-    const char* data = write_buffer_.data() + bytes_written_;
-    std::size_t remaining = write_buffer_.size() - bytes_written_;
-    ssize_t bytes_sent = send(sockfd, data, remaining, MSG_NOSIGNAL);
+  const std::size_t total_size = write_buffer_.size() + mapped_file_size_;
+  while (bytes_written_ < total_size) {
+    iovec vectors[2]{};
+    int vector_count = 0;
+    std::size_t offset = bytes_written_;
+
+    if (offset < write_buffer_.size()) {
+      vectors[vector_count].iov_base =
+          const_cast<char*>(write_buffer_.data() + offset);
+      vectors[vector_count].iov_len = write_buffer_.size() - offset;
+      ++vector_count;
+      offset = 0;
+    } else {
+      offset -= write_buffer_.size();
+    }
+
+    if (mapped_file_ && offset < mapped_file_size_) {
+      vectors[vector_count].iov_base =
+          static_cast<char*>(mapped_file_) + offset;
+      vectors[vector_count].iov_len = mapped_file_size_ - offset;
+      ++vector_count;
+    }
+
+    ssize_t bytes_sent = writev(sockfd, vectors, vector_count);
     if (bytes_sent > 0) {
       bytes_written_ += static_cast<std::size_t>(bytes_sent);
       continue;
@@ -87,6 +134,7 @@ HttpConnection::WriteResult HttpConnection::writeToSocket(int sockfd) {
     return WriteResult::kError;
   }
 
+  releaseMappedFile();
   if (!keep_alive_) {
     return WriteResult::kClose;
   }
@@ -113,7 +161,7 @@ HttpConnection::WriteResult HttpConnection::writeToSocket(int sockfd) {
 HttpConnection::ParseResult HttpConnection::parseRequest() {
   while (true) {
     if (parse_state_ == ParseState::kBody) {
-      if (content_length_ > kMaxRequestSize) {
+      if (content_length_ > kMaxBodySize) {
         return ParseResult::kPayloadTooLarge;
       }
       if (read_buffer_.size() - parse_position_ < content_length_) {
@@ -126,7 +174,13 @@ HttpConnection::ParseResult HttpConnection::parseRequest() {
 
     std::size_t line_end = read_buffer_.find("\r\n", parse_position_);
     if (line_end == std::string::npos) {
+      if (read_buffer_.size() - parse_position_ > kMaxHeaderSize) {
+        return ParseResult::kPayloadTooLarge;
+      }
       return ParseResult::kIncomplete;
+    }
+    if (line_end > kMaxHeaderSize) {
+      return ParseResult::kPayloadTooLarge;
     }
     std::string line =
         read_buffer_.substr(parse_position_, line_end - parse_position_);
@@ -141,6 +195,15 @@ HttpConnection::ParseResult HttpConnection::parseRequest() {
     }
 
     if (line.empty()) {
+      if (version_ == "HTTP/1.1" &&
+          (headers_.find("host") == headers_.end() ||
+           headers_["host"].empty())) {
+        return ParseResult::kBadRequest;
+      }
+      if (headers_.find("transfer-encoding") != headers_.end()) {
+        return ParseResult::kBadRequest;
+      }
+
       auto length = headers_.find("content-length");
       if (length != headers_.end()) {
         try {
@@ -148,6 +211,9 @@ HttpConnection::ParseResult HttpConnection::parseRequest() {
           content_length_ = std::stoull(length->second, &consumed);
           if (consumed != length->second.size()) {
             return ParseResult::kBadRequest;
+          }
+          if (content_length_ > kMaxBodySize) {
+            return ParseResult::kPayloadTooLarge;
           }
         } catch (...) {
           return ParseResult::kBadRequest;
@@ -181,7 +247,13 @@ bool HttpConnection::parseRequestLine(const std::string& line) {
   if (!(stream >> method_ >> target_ >> version_) || (stream >> extra)) {
     return false;
   }
-  return !target_.empty() &&
+  if (method_.empty() ||
+      !std::all_of(method_.begin(), method_.end(), [](unsigned char ch) {
+        return std::isupper(ch);
+      })) {
+    return false;
+  }
+  return !target_.empty() && target_.front() == '/' &&
          (version_ == "HTTP/1.0" || version_ == "HTTP/1.1");
 }
 
@@ -191,24 +263,64 @@ bool HttpConnection::parseHeader(const std::string& line) {
     return false;
   }
   std::string name = toLower(trim(line.substr(0, separator)));
-  if (name.empty()) {
+  if (name.empty() ||
+      !std::all_of(name.begin(), name.end(), [](unsigned char ch) {
+        return std::isalnum(ch) || ch == '-';
+      })) {
     return false;
   }
-  headers_[name] = trim(line.substr(separator + 1));
+  std::string value = trim(line.substr(separator + 1));
+  auto existing = headers_.find(name);
+  if (existing != headers_.end()) {
+    if (name == "content-length") {
+      return existing->second == value;
+    }
+    existing->second += "," + value;
+  } else {
+    headers_[name] = std::move(value);
+  }
   return true;
 }
 
 void HttpConnection::buildResponse() {
+  if (method_ == "POST") {
+    std::string content_type = "text/plain; charset=utf-8";
+    auto requested_type = headers_.find("content-type");
+    if (requested_type != headers_.end() && !requested_type->second.empty()) {
+      content_type = requested_type->second;
+    }
+    buildMemoryResponse(200, "OK", content_type, body_);
+    return;
+  }
   if (method_ != "GET") {
-    buildErrorResponse(405, "Method Not Allowed", "Only GET is supported.");
+    std::string body = "405 Method Not Allowed\nOnly GET and POST are supported.\n";
+    buildMemoryResponse(405, "Method Not Allowed",
+                        "text/plain; charset=utf-8", body,
+                        "Allow: GET, POST\r\n");
     return;
   }
   if (target_ == "/health") {
     buildMemoryResponse(200, "OK", "text/plain; charset=utf-8", "OK\n");
     return;
   }
-  if (!buildStaticFileResponse()) {
-    buildErrorResponse(404, "Not Found", "The requested file was not found.");
+  switch (buildStaticFileResponse()) {
+    case StaticFileResult::kOk:
+      return;
+    case StaticFileResult::kBadRequest:
+      buildErrorResponse(400, "Bad Request", "The request path is invalid.");
+      return;
+    case StaticFileResult::kForbidden:
+      buildErrorResponse(403, "Forbidden", "Access to this path is denied.");
+      return;
+    case StaticFileResult::kNotFound:
+      buildErrorResponse(404, "Not Found",
+                         "The requested file was not found.");
+      return;
+    case StaticFileResult::kInternalError:
+      keep_alive_ = false;
+      buildErrorResponse(500, "Internal Server Error",
+                         "The server could not read the requested file.");
+      return;
   }
 }
 
@@ -221,11 +333,13 @@ void HttpConnection::buildErrorResponse(int status, const std::string& reason,
 
 void HttpConnection::buildMemoryResponse(
     int status, const std::string& reason, const std::string& content_type,
-    const std::string& body) {
+    const std::string& body, const std::string& extra_headers) {
+  releaseMappedFile();
   std::ostringstream response;
   response << "HTTP/1.1 " << status << ' ' << reason << "\r\n"
            << "Content-Length: " << body.size() << "\r\n"
            << "Content-Type: " << content_type << "\r\n"
+           << extra_headers
            << "Connection: " << (keep_alive_ ? "keep-alive" : "close")
            << "\r\n\r\n"
            << body;
@@ -233,7 +347,8 @@ void HttpConnection::buildMemoryResponse(
   bytes_written_ = 0;
 }
 
-bool HttpConnection::buildStaticFileResponse() {
+HttpConnection::StaticFileResult HttpConnection::buildStaticFileResponse() {
+  releaseMappedFile();
   std::string raw_path = target_;
   std::size_t query = raw_path.find_first_of("?#");
   if (query != std::string::npos) {
@@ -243,33 +358,112 @@ bool HttpConnection::buildStaticFileResponse() {
   std::string decoded_path;
   if (!decodeUrlPath(raw_path, &decoded_path) || decoded_path.empty() ||
       decoded_path.front() != '/') {
-    return false;
+    return StaticFileResult::kBadRequest;
   }
   if (decoded_path == "/") {
     decoded_path = "/index.html";
   }
 
-  std::filesystem::path relative =
-      std::filesystem::path(decoded_path.substr(1)).lexically_normal();
+  std::filesystem::path requested(decoded_path.substr(1));
+  for (const auto& part : requested) {
+    if (part == "..") {
+      return StaticFileResult::kForbidden;
+    }
+  }
+  std::filesystem::path relative = requested.lexically_normal();
   for (const auto& part : relative) {
     if (part == "..") {
-      return false;
+      return StaticFileResult::kForbidden;
     }
   }
 
   std::filesystem::path file_path =
       std::filesystem::path(kDocumentRoot) / relative;
-  std::ifstream file(file_path, std::ios::binary);
-  if (!file) {
-    return false;
+  std::error_code path_error;
+  std::filesystem::path canonical_root =
+      std::filesystem::canonical(kDocumentRoot, path_error);
+  if (path_error) {
+    return StaticFileResult::kInternalError;
   }
-  std::string body((std::istreambuf_iterator<char>(file)),
-                   std::istreambuf_iterator<char>());
-  buildMemoryResponse(200, "OK", contentTypeForPath(file_path.string()), body);
-  return true;
+  std::filesystem::path canonical_file =
+      std::filesystem::canonical(file_path, path_error);
+  if (path_error) {
+    if (path_error == std::errc::no_such_file_or_directory ||
+        path_error == std::errc::not_a_directory) {
+      return StaticFileResult::kNotFound;
+    }
+    if (path_error == std::errc::permission_denied) {
+      return StaticFileResult::kForbidden;
+    }
+    return StaticFileResult::kInternalError;
+  }
+  if (!pathIsWithin(canonical_root, canonical_file)) {
+    return StaticFileResult::kForbidden;
+  }
+
+  int file_fd = open(canonical_file.c_str(), O_RDONLY | O_CLOEXEC);
+  if (file_fd < 0) {
+    if (errno == ENOENT || errno == ENOTDIR) {
+      return StaticFileResult::kNotFound;
+    }
+    if (errno == EACCES || errno == EPERM || errno == ELOOP) {
+      return StaticFileResult::kForbidden;
+    }
+    return StaticFileResult::kInternalError;
+  }
+
+  struct stat file_stat {};
+  if (fstat(file_fd, &file_stat) < 0) {
+    close(file_fd);
+    return StaticFileResult::kInternalError;
+  }
+  if (!S_ISREG(file_stat.st_mode) ||
+      (file_stat.st_mode & (S_IRUSR | S_IRGRP | S_IROTH)) == 0) {
+    close(file_fd);
+    return StaticFileResult::kForbidden;
+  }
+  if (file_stat.st_size < 0 ||
+      static_cast<unsigned long long>(file_stat.st_size) >
+          std::numeric_limits<std::size_t>::max()) {
+    close(file_fd);
+    return StaticFileResult::kInternalError;
+  }
+
+  mapped_file_size_ = static_cast<std::size_t>(file_stat.st_size);
+  if (mapped_file_size_ > 0) {
+    mapped_file_ =
+        mmap(nullptr, mapped_file_size_, PROT_READ, MAP_PRIVATE, file_fd, 0);
+    if (mapped_file_ == MAP_FAILED) {
+      mapped_file_ = nullptr;
+      mapped_file_size_ = 0;
+      close(file_fd);
+      return StaticFileResult::kInternalError;
+    }
+  }
+  close(file_fd);
+
+  std::ostringstream response;
+  response << "HTTP/1.1 200 OK\r\n"
+           << "Content-Length: " << mapped_file_size_ << "\r\n"
+           << "Content-Type: " << contentTypeForPath(file_path.string())
+           << "\r\n"
+           << "Connection: " << (keep_alive_ ? "keep-alive" : "close")
+           << "\r\n\r\n";
+  write_buffer_ = response.str();
+  bytes_written_ = 0;
+  return StaticFileResult::kOk;
+}
+
+void HttpConnection::releaseMappedFile() {
+  if (mapped_file_) {
+    munmap(mapped_file_, mapped_file_size_);
+    mapped_file_ = nullptr;
+  }
+  mapped_file_size_ = 0;
 }
 
 void HttpConnection::resetRequest() {
+  releaseMappedFile();
   read_buffer_.erase(0, parse_position_);
   write_buffer_.clear();
   parse_position_ = 0;
@@ -312,6 +506,9 @@ std::string HttpConnection::contentTypeForPath(const std::string& path) {
   if (extension == ".jpg" || extension == ".jpeg") return "image/jpeg";
   if (extension == ".gif") return "image/gif";
   if (extension == ".svg") return "image/svg+xml";
+  if (extension == ".mp4") return "video/mp4";
+  if (extension == ".webm") return "video/webm";
+  if (extension == ".txt") return "text/plain; charset=utf-8";
   return "application/octet-stream";
 }
 

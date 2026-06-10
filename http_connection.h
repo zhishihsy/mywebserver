@@ -22,6 +22,10 @@ class HttpConnection {
   };
 
   HttpConnection();
+  ~HttpConnection();
+
+  HttpConnection(const HttpConnection&) = delete;
+  HttpConnection& operator=(const HttpConnection&) = delete;
 
   ReadResult readFromSocket(int sockfd, bool edge_triggered);
   WriteResult writeToSocket(int sockfd);
@@ -40,6 +44,14 @@ class HttpConnection {
     kPayloadTooLarge,
   };
 
+  enum class StaticFileResult {
+    kOk,
+    kBadRequest,
+    kForbidden,
+    kNotFound,
+    kInternalError,
+  };
+
   ParseResult parseRequest();
   bool parseRequestLine(const std::string& line);
   bool parseHeader(const std::string& line);
@@ -48,8 +60,10 @@ class HttpConnection {
                           const std::string& message);
   void buildMemoryResponse(int status, const std::string& reason,
                            const std::string& content_type,
-                           const std::string& body);
-  bool buildStaticFileResponse();
+                           const std::string& body,
+                           const std::string& extra_headers = "");
+  StaticFileResult buildStaticFileResponse();
+  void releaseMappedFile();
   void resetRequest();
 
   static std::string trim(const std::string& value);
@@ -63,6 +77,8 @@ class HttpConnection {
   std::size_t parse_position_;
   std::size_t content_length_;
   std::size_t bytes_written_;
+  void* mapped_file_;
+  std::size_t mapped_file_size_;
 
   std::string method_;
   std::string target_;
