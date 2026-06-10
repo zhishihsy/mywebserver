@@ -8,15 +8,20 @@
 class HttpConnection {
  public:
   enum class ReadResult {
-    kNeedMoreData,
-    kResponseReady,
+    kDataReady,
     kPeerClosed,
     kError,
+  };
+
+  enum class ProcessResult {
+    kNeedMoreData,
+    kResponseReady,
   };
 
   enum class WriteResult {
     kWantRead,
     kWantWrite,
+    kWantProcess,
     kClose,
     kError,
   };
@@ -28,6 +33,7 @@ class HttpConnection {
   HttpConnection& operator=(const HttpConnection&) = delete;
 
   ReadResult readFromSocket(int sockfd, bool edge_triggered);
+  ProcessResult processRequest();
   WriteResult writeToSocket(int sockfd);
 
  private:

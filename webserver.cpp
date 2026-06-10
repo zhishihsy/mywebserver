@@ -66,12 +66,8 @@ void WebServer::init(const ServerConfig& config) {
   idle_timeout_ =
       std::chrono::seconds(std::max(1, config.idle_timeout_seconds));
 
-  // Reactor 将读写事件交给工作线程；Proactor 由事件线程直接处理。
-  if (actor_model_ == 1) {
-    thread_pool_ = std::make_unique<ThreadPool>(thread_count_);
-  } else {
-    thread_pool_.reset();
-  }
+  // Proactor 在线程池中处理业务；Reactor 在线程池中处理整个连接事件。
+  thread_pool_ = std::make_unique<ThreadPool>(thread_count_);
 }
 
 void WebServer::setSignalFd(int signal_fd) {
@@ -317,7 +313,6 @@ WebServer::ClientPtr WebServer::findClient(int sockfd) {
 
 bool WebServer::dispatchClientEvent(const ClientPtr& client,
                                     uint32_t event) {
-  // EPOLLONESHOT 配合 busy 标志，保证同一连接不会被并发处理。
   bool expected = false;
   if (!client->busy.compare_exchange_strong(expected, true)) {
     return true;
@@ -325,44 +320,57 @@ bool WebServer::dispatchClientEvent(const ClientPtr& client,
 
   refreshTimer(client);
   if (actor_model_ == 0) {
-    // Proactor：事件线程直接完成当前连接的读写处理。
-    handleClientEvent(client, event);
-    return true;
+    return handleProactorEvent(client, event);
   }
 
-  // Reactor：只分发就绪事件，实际读写由线程池完成。
   bool enqueued = thread_pool_ && thread_pool_->enqueue([this, client, event] {
     if (client->closed.load()) {
       client->busy.store(false);
       return;
     }
+    handleClientEvent(client, event);
+  });
 
-    ClientAction action = ClientAction::kClose;
-    if (event & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
-      std::cout << "Connection closed (fd: " << client->sockfd << ")"
-                << std::endl;
-    } else if (event & EPOLLIN) {
-      action = dealwithread(client);
-    } else if (event & EPOLLOUT) {
-      action = dealwithwrite(client);
+  if (!enqueued) {
+    client->busy.store(false);
+  }
+  return enqueued;
+}
+
+bool WebServer::handleProactorEvent(const ClientPtr& client,
+                                    uint32_t event) {
+  ClientAction action = ClientAction::kClose;
+
+  if (event & EPOLLIN) {
+    HttpConnection::ReadResult result = client->connection.readFromSocket(
+        client->sockfd, connect_trig_mode_ == 1);
+    if (result == HttpConnection::ReadResult::kDataReady) {
+      return enqueueBusiness(client);
     }
+  } else if (event & EPOLLOUT) {
+    HttpConnection::WriteResult result =
+        client->connection.writeToSocket(client->sockfd);
+    if (result == HttpConnection::WriteResult::kWantProcess) {
+      return enqueueBusiness(client);
+    }
+    if (result == HttpConnection::WriteResult::kWantRead) {
+      action = ClientAction::kWaitForRead;
+    } else if (result == HttpConnection::WriteResult::kWantWrite) {
+      action = ClientAction::kWaitForWrite;
+    }
+  }
 
-    if (action == ClientAction::kClose) {
-      closeClient(client);
+  finishClientAction(client, action);
+  return true;
+}
+
+bool WebServer::enqueueBusiness(const ClientPtr& client) {
+  bool enqueued = thread_pool_ && thread_pool_->enqueue([this, client] {
+    if (client->closed.load()) {
       client->busy.store(false);
       return;
     }
-
-    refreshTimer(client);
-    client->busy.store(false);
-
-    // 重新激活 EPOLLONESHOT 必须是任务的最后一步。
-    if (!client->closed.load()) {
-      int next_event = action == ClientAction::kWaitForRead
-                           ? EPOLLIN
-                           : EPOLLOUT;
-      modFd(epoll_fd_, client->sockfd, next_event, connect_trig_mode_);
-    }
+    finishClientAction(client, processClient(client));
   });
 
   if (!enqueued) {
@@ -379,15 +387,33 @@ void WebServer::handleClientEvent(const ClientPtr& client,
   }
 
   ClientAction action = ClientAction::kClose;
-  if (event & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
-    std::cout << "Connection closed (fd: " << client->sockfd << ")"
-              << std::endl;
-  } else if (event & EPOLLIN) {
+  if (event & EPOLLIN) {
     action = dealwithread(client);
   } else if (event & EPOLLOUT) {
     action = dealwithwrite(client);
+  } else if (event & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
+    std::cout << "Connection closed (fd: " << client->sockfd << ")"
+              << std::endl;
   }
 
+  finishClientAction(client, action);
+}
+
+WebServer::ClientAction WebServer::processClient(
+    const ClientPtr& client) {
+  if (!client || client->closed.load()) {
+    return ClientAction::kClose;
+  }
+
+  HttpConnection::ProcessResult result =
+      client->connection.processRequest();
+  return result == HttpConnection::ProcessResult::kResponseReady
+             ? ClientAction::kWaitForWrite
+             : ClientAction::kWaitForRead;
+}
+
+void WebServer::finishClientAction(const ClientPtr& client,
+                                   ClientAction action) {
   if (action == ClientAction::kClose) {
     closeClient(client);
     client->busy.store(false);
@@ -410,16 +436,11 @@ WebServer::ClientAction WebServer::dealwithread(
     return ClientAction::kClose;
   }
 
-  int sockfd = client->sockfd;
-  HttpConnection::ReadResult result =
-      client->connection.readFromSocket(sockfd, connect_trig_mode_ == 1);
-  if (result == HttpConnection::ReadResult::kNeedMoreData) {
-    return ClientAction::kWaitForRead;
+  HttpConnection::ReadResult result = client->connection.readFromSocket(
+      client->sockfd, connect_trig_mode_ == 1);
+  if (result == HttpConnection::ReadResult::kDataReady) {
+    return processClient(client);
   }
-  if (result == HttpConnection::ReadResult::kResponseReady) {
-    return ClientAction::kWaitForWrite;
-  }
-
   return ClientAction::kClose;
 }
 
@@ -429,16 +450,17 @@ WebServer::ClientAction WebServer::dealwithwrite(
     return ClientAction::kClose;
   }
 
-  int sockfd = client->sockfd;
   HttpConnection::WriteResult result =
-      client->connection.writeToSocket(sockfd);
+      client->connection.writeToSocket(client->sockfd);
   if (result == HttpConnection::WriteResult::kWantRead) {
     return ClientAction::kWaitForRead;
   }
   if (result == HttpConnection::WriteResult::kWantWrite) {
     return ClientAction::kWaitForWrite;
   }
-
+  if (result == HttpConnection::WriteResult::kWantProcess) {
+    return processClient(client);
+  }
   return ClientAction::kClose;
 }
 

@@ -3,7 +3,7 @@ CXXFLAGS := -std=c++17 -Wall -Wextra -pedantic -O2 -pthread
 TARGET := webserver
 SOURCES := main.cpp webserver.cpp http_connection.cpp
 
-.PHONY: build run stress test clean
+.PHONY: build run stress test phase3 clean
 
 build: $(TARGET)
 
@@ -18,6 +18,9 @@ stress:
 
 test: build
 	python3 tests/http_phase2_test.py
+
+phase3: build
+	python3 tests/concurrency_phase3_test.py
 
 clean:
 	rm -f $(TARGET)

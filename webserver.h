@@ -21,7 +21,7 @@ struct ServerConfig {
   int port = 8080;                    // 监听端口。
   int trigger_mode = 0;               // 0~3，对应监听/连接的 LT、ET 组合。
   int linger = 0;                     // 是否启用 SO_LINGER。
-  std::size_t thread_count = 8;       // Reactor 模式的工作线程数。
+  std::size_t thread_count = 8;       // 业务/事件工作线程数。
   int actor_model = 0;                // 0=Proactor，1=Reactor。
   int idle_timeout_seconds = 60;      // 空闲连接超时时间。
 };
@@ -86,7 +86,11 @@ class WebServer {
 
   // 根据 actor_model 决定在事件线程还是工作线程中处理连接事件。
   bool dispatchClientEvent(const ClientPtr& client, uint32_t event);
+  bool handleProactorEvent(const ClientPtr& client, uint32_t event);
+  bool enqueueBusiness(const ClientPtr& client);
   void handleClientEvent(const ClientPtr& client, uint32_t event);
+  ClientAction processClient(const ClientPtr& client);
+  void finishClientAction(const ClientPtr& client, ClientAction action);
   ClientAction dealwithread(const ClientPtr& client);
   ClientAction dealwithwrite(const ClientPtr& client);
 
@@ -114,7 +118,7 @@ class WebServer {
   // 自管道读端，用于让信号处理函数唤醒 epoll_wait。
   int signal_fd_;
 
-  // Proactor 模式不创建线程池；Reactor 模式按 thread_count 创建。
+  // 两种模型都使用线程池，区别在于网络 I/O 由哪一层执行。
   std::unique_ptr<ThreadPool> thread_pool_;
   std::mutex clients_mutex_;
   std::map<int, ClientPtr> clients_;

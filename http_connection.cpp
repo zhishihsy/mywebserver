@@ -50,17 +50,13 @@ HttpConnection::~HttpConnection() {
 HttpConnection::ReadResult HttpConnection::readFromSocket(
     int sockfd, bool edge_triggered) {
   char buffer[kReadChunkSize];
-  bool peer_closed = false;
+  bool received_data = false;
 
   while (true) {
     ssize_t bytes_read = recv(sockfd, buffer, sizeof(buffer), 0);
     if (bytes_read > 0) {
+      received_data = true;
       read_buffer_.append(buffer, static_cast<std::size_t>(bytes_read));
-      if (read_buffer_.size() > kMaxBufferedSize) {
-        keep_alive_ = false;
-        buildErrorResponse(413, "Payload Too Large", "Request is too large.");
-        return ReadResult::kResponseReady;
-      }
       if (!edge_triggered) {
         break;
       }
@@ -68,8 +64,8 @@ HttpConnection::ReadResult HttpConnection::readFromSocket(
     }
 
     if (bytes_read == 0) {
-      peer_closed = true;
-      break;
+      return received_data ? ReadResult::kDataReady
+                           : ReadResult::kPeerClosed;
     }
     if (errno == EINTR) {
       continue;
@@ -80,9 +76,19 @@ HttpConnection::ReadResult HttpConnection::readFromSocket(
     return ReadResult::kError;
   }
 
+  return ReadResult::kDataReady;
+}
+
+HttpConnection::ProcessResult HttpConnection::processRequest() {
+  if (read_buffer_.size() > kMaxBufferedSize) {
+    keep_alive_ = false;
+    buildErrorResponse(413, "Payload Too Large", "Request is too large.");
+    return ProcessResult::kResponseReady;
+  }
+
   ParseResult result = parseRequest();
   if (result == ParseResult::kIncomplete) {
-    return peer_closed ? ReadResult::kPeerClosed : ReadResult::kNeedMoreData;
+    return ProcessResult::kNeedMoreData;
   }
   if (result == ParseResult::kBadRequest) {
     keep_alive_ = false;
@@ -93,7 +99,7 @@ HttpConnection::ReadResult HttpConnection::readFromSocket(
   } else {
     buildResponse();
   }
-  return ReadResult::kResponseReady;
+  return ProcessResult::kResponseReady;
 }
 
 HttpConnection::WriteResult HttpConnection::writeToSocket(int sockfd) {
@@ -140,22 +146,8 @@ HttpConnection::WriteResult HttpConnection::writeToSocket(int sockfd) {
   }
 
   resetRequest();
-  ParseResult result = parseRequest();
-  if (result == ParseResult::kComplete) {
-    buildResponse();
-    return WriteResult::kWantWrite;
-  }
-  if (result == ParseResult::kBadRequest) {
-    keep_alive_ = false;
-    buildErrorResponse(400, "Bad Request", "Malformed HTTP request.");
-    return WriteResult::kWantWrite;
-  }
-  if (result == ParseResult::kPayloadTooLarge) {
-    keep_alive_ = false;
-    buildErrorResponse(413, "Payload Too Large", "Request is too large.");
-    return WriteResult::kWantWrite;
-  }
-  return WriteResult::kWantRead;
+  return read_buffer_.empty() ? WriteResult::kWantRead
+                              : WriteResult::kWantProcess;
 }
 
 HttpConnection::ParseResult HttpConnection::parseRequest() {
