@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -15,26 +16,37 @@
 #include <queue>
 #include <vector>
 
+// 服务器启动配置，由 main 解析命令行后统一传入。
+struct ServerConfig {
+  int port = 8080;                    // 监听端口。
+  int trigger_mode = 0;               // 0~3，对应监听/连接的 LT、ET 组合。
+  int linger = 0;                     // 是否启用 SO_LINGER。
+  std::size_t thread_count = 8;       // Reactor 模式的工作线程数。
+  int actor_model = 0;                // 0=Proactor，1=Reactor。
+  int idle_timeout_seconds = 60;      // 空闲连接超时时间。
+};
+
 class WebServer {
  public:
   WebServer();
   ~WebServer();
 
-  // 保存服务器配置，此时不会创建 socket。
-  void init(int port, int trig_mode, int linger_option,
-            int idle_timeout_seconds = 60);
+  // 保存配置并按并发模型创建所需线程池。
+  void init(const ServerConfig& config);
 
-  // 根据组合模式设置监听 socket 和客户端 socket 的 LT/ET 模式。
+  // signal_fd 由 main 持有，服务器仅将其注册到 epoll，不负责关闭。
+  void setSignalFd(int signal_fd);
+
+  // 根据 trigger_mode 拆分监听 socket 和客户端 socket 的触发模式。
   void trig_mode();
 
-  // 创建监听 socket 和 epoll 实例，并注册监听事件。
+  // 创建监听 socket、epoll，并注册监听 fd 与信号通知 fd。
   bool eventListen();
 
-  // 持续等待并分发 epoll 事件。
+  // 运行事件循环，收到退出信号后返回。
   void eventLoop();
 
  private:
-  // 保存一个客户端连接对应的地址和文件描述符。
   struct ClientData {
     sockaddr_in address{};
     int sockfd{-1};
@@ -66,45 +78,44 @@ class WebServer {
     }
   };
 
-  // 根据监听 socket 的触发模式接收新连接。
   bool dealclinetdata();
   bool acceptConnectionLT();
   bool acceptConnectionET();
 
-  // 将客户端事件交给线程池，并在工作线程中处理读写。
   ClientPtr findClient(int sockfd);
+
+  // 根据 actor_model 决定在事件线程还是工作线程中处理连接事件。
   bool dispatchClientEvent(const ClientPtr& client, uint32_t event);
+  void handleClientEvent(const ClientPtr& client, uint32_t event);
   ClientAction dealwithread(const ClientPtr& client);
   ClientAction dealwithwrite(const ClientPtr& client);
 
-  // 刷新连接期限，并清理已经到期的空闲连接。
   void refreshTimer(const ClientPtr& client);
   void expireIdleConnections();
   int nextTimerTimeout();
-
-  // 从 epoll 和客户端表中移除连接，并关闭 socket。
   void closeClient(const ClientPtr& client);
 
-  // epoll 文件描述符操作辅助函数。
   static int setNonblocking(int fd);
   static void addFd(int epollfd, int fd, bool one_shot, int trig_mode);
   static void removeFd(int epollfd, int fd);
   static void modFd(int epollfd, int fd, int event, int trig_mode);
 
-  // 服务器配置。
   int port_;
   int trig_mode_;
   int listen_trig_mode_;
   int connect_trig_mode_;
   int linger_option_;
+  std::size_t thread_count_;
+  int actor_model_;
   std::chrono::milliseconds idle_timeout_;
 
-  // 服务器运行期间持有的文件描述符。
   int listen_fd_;
   int epoll_fd_;
+  // 自管道读端，用于让信号处理函数唤醒 epoll_wait。
+  int signal_fd_;
 
-  // 以客户端 socket 为键保存连接信息。
-  ThreadPool thread_pool_;
+  // Proactor 模式不创建线程池；Reactor 模式按 thread_count 创建。
+  std::unique_ptr<ThreadPool> thread_pool_;
   std::mutex clients_mutex_;
   std::map<int, ClientPtr> clients_;
 

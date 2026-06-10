@@ -22,12 +22,18 @@ WebServer::WebServer()
       listen_trig_mode_(0),
       connect_trig_mode_(0),
       linger_option_(0),
+      thread_count_(8),
+      actor_model_(0),
       idle_timeout_(std::chrono::seconds(60)),
       listen_fd_(-1),
-      epoll_fd_(-1) {}
+      epoll_fd_(-1),
+      signal_fd_(-1) {}
 
 WebServer::~WebServer() {
-  thread_pool_.shutdown();
+  // 先等待工作任务结束，避免线程继续访问随后释放的连接和 epoll。
+  if (thread_pool_) {
+    thread_pool_->shutdown();
+  }
 
   // 先关闭所有客户端，再释放监听 socket 和 epoll。
   while (true) {
@@ -51,13 +57,25 @@ WebServer::~WebServer() {
   }
 }
 
-void WebServer::init(int port, int trig_mode, int linger_option,
-                     int idle_timeout_seconds) {
-  port_ = port;
-  trig_mode_ = trig_mode;
-  linger_option_ = linger_option;
+void WebServer::init(const ServerConfig& config) {
+  port_ = config.port;
+  trig_mode_ = config.trigger_mode;
+  linger_option_ = config.linger;
+  thread_count_ = config.thread_count;
+  actor_model_ = config.actor_model;
   idle_timeout_ =
-      std::chrono::seconds(std::max(1, idle_timeout_seconds));
+      std::chrono::seconds(std::max(1, config.idle_timeout_seconds));
+
+  // Reactor 将读写事件交给工作线程；Proactor 由事件线程直接处理。
+  if (actor_model_ == 1) {
+    thread_pool_ = std::make_unique<ThreadPool>(thread_count_);
+  } else {
+    thread_pool_.reset();
+  }
+}
+
+void WebServer::setSignalFd(int signal_fd) {
+  signal_fd_ = signal_fd;
 }
 
 void WebServer::trig_mode() {
@@ -138,6 +156,10 @@ bool WebServer::eventListen() {
 
   // 监听 socket 不使用 EPOLLONESHOT。
   addFd(epoll_fd_, listen_fd_, false, listen_trig_mode_);
+  if (signal_fd_ >= 0) {
+    // 信号到达后管道变为可读，从而立即唤醒阻塞中的 epoll_wait。
+    addFd(epoll_fd_, signal_fd_, false, 0);
+  }
   return true;
 }
 
@@ -151,8 +173,13 @@ void WebServer::eventLoop() {
             << (connect_trig_mode_ ? "ET" : "LT") << std::endl;
   std::cout << " > Idle Timeout: " << idle_timeout_.count() / 1000
             << "s" << std::endl;
+  std::cout << " > Actor Model: "
+            << (actor_model_ == 0 ? "Proactor" : "Reactor")
+            << std::endl;
+  std::cout << " > Worker Threads: " << thread_count_ << std::endl;
 
-  while (true) {
+  bool running = true;
+  while (running) {
     expireIdleConnections();
 
     // 最多等待到最近一个连接到期，之后执行超时清理。
@@ -173,7 +200,14 @@ void WebServer::eventLoop() {
       int sockfd = events[i].data.fd;
       uint32_t event = events[i].events;
 
-      if (sockfd == listen_fd_) {
+      if (sockfd == signal_fd_) {
+        // 排空管道，合并处理短时间内到达的多个退出信号。
+        char signal_buffer[64];
+        while (read(signal_fd_, signal_buffer, sizeof(signal_buffer)) > 0) {
+        }
+        running = false;
+        break;
+      } else if (sockfd == listen_fd_) {
         // 监听 socket 可读，说明有新连接到达。
         dealclinetdata();
       } else {
@@ -186,6 +220,8 @@ void WebServer::eventLoop() {
       }
     }
   }
+
+  std::cout << "Server stopping gracefully" << std::endl;
 }
 
 bool WebServer::dealclinetdata() {
@@ -281,13 +317,21 @@ WebServer::ClientPtr WebServer::findClient(int sockfd) {
 
 bool WebServer::dispatchClientEvent(const ClientPtr& client,
                                     uint32_t event) {
+  // EPOLLONESHOT 配合 busy 标志，保证同一连接不会被并发处理。
   bool expected = false;
   if (!client->busy.compare_exchange_strong(expected, true)) {
     return true;
   }
 
   refreshTimer(client);
-  bool enqueued = thread_pool_.enqueue([this, client, event] {
+  if (actor_model_ == 0) {
+    // Proactor：事件线程直接完成当前连接的读写处理。
+    handleClientEvent(client, event);
+    return true;
+  }
+
+  // Reactor：只分发就绪事件，实际读写由线程池完成。
+  bool enqueued = thread_pool_ && thread_pool_->enqueue([this, client, event] {
     if (client->closed.load()) {
       client->busy.store(false);
       return;
@@ -325,6 +369,39 @@ bool WebServer::dispatchClientEvent(const ClientPtr& client,
     client->busy.store(false);
   }
   return enqueued;
+}
+
+void WebServer::handleClientEvent(const ClientPtr& client,
+                                  uint32_t event) {
+  if (client->closed.load()) {
+    client->busy.store(false);
+    return;
+  }
+
+  ClientAction action = ClientAction::kClose;
+  if (event & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
+    std::cout << "Connection closed (fd: " << client->sockfd << ")"
+              << std::endl;
+  } else if (event & EPOLLIN) {
+    action = dealwithread(client);
+  } else if (event & EPOLLOUT) {
+    action = dealwithwrite(client);
+  }
+
+  if (action == ClientAction::kClose) {
+    closeClient(client);
+    client->busy.store(false);
+    return;
+  }
+
+  refreshTimer(client);
+  client->busy.store(false);
+
+  if (!client->closed.load()) {
+    int next_event =
+        action == ClientAction::kWaitForRead ? EPOLLIN : EPOLLOUT;
+    modFd(epoll_fd_, client->sockfd, next_event, connect_trig_mode_);
+  }
 }
 
 WebServer::ClientAction WebServer::dealwithread(
