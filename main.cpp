@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <iostream>
+#include <string>
 
 namespace {
 // 信号处理函数通过管道通知 epoll 主循环，避免在信号上下文中执行复杂清理。
@@ -38,6 +39,61 @@ bool parseInteger(const char* text, int minimum, int maximum,
   }
 
   *value = static_cast<int>(parsed);
+  return true;
+}
+
+bool loadDatabaseConfig(ServerConfig* config, std::string* error) {
+  const char* enabled = std::getenv("MYSQL_ENABLED");
+  if (!enabled || std::string(enabled) == "0") {
+    config->database.enabled = false;
+    config->database.pool_size = config->thread_count;
+    return true;
+  }
+  if (std::string(enabled) != "1") {
+    *error = "MYSQL_ENABLED 只能设置为 0 或 1";
+    return false;
+  }
+
+  config->database.enabled = true;
+  config->database.pool_size = config->thread_count;
+
+  if (const char* value = std::getenv("MYSQL_HOST")) {
+    config->database.host = value;
+  }
+  if (const char* value = std::getenv("MYSQL_USER")) {
+    config->database.user = value;
+  }
+  if (const char* value = std::getenv("MYSQL_PASSWORD")) {
+    config->database.password = value;
+  }
+  if (const char* value = std::getenv("MYSQL_DATABASE")) {
+    config->database.database = value;
+  }
+
+  int parsed = 0;
+  if (const char* value = std::getenv("MYSQL_PORT")) {
+    if (!parseInteger(value, 1, 65535, &parsed)) {
+      *error = "MYSQL_PORT 必须在 1-65535 范围内";
+      return false;
+    }
+    config->database.port = static_cast<unsigned int>(parsed);
+  }
+  if (const char* value = std::getenv("MYSQL_POOL_SIZE")) {
+    if (!parseInteger(value, 1, 1024, &parsed)) {
+      *error = "MYSQL_POOL_SIZE 必须在 1-1024 范围内";
+      return false;
+    }
+    config->database.pool_size = static_cast<std::size_t>(parsed);
+  }
+
+  if (config->database.user.empty()) {
+    *error = "MYSQL_ENABLED=1 时必须设置 MYSQL_USER";
+    return false;
+  }
+  if (config->database.database.empty()) {
+    *error = "MYSQL_DATABASE 不能为空";
+    return false;
+  }
   return true;
 }
 
@@ -127,6 +183,13 @@ int main(int argc, char* argv[]) {
     return 2;
   }
 
+  std::string database_error;
+  if (!loadDatabaseConfig(&config, &database_error)) {
+    std::cerr << "数据库配置无效："
+              << database_error << '\n';
+    return 2;
+  }
+
   // 管道读端交给 epoll，写端只由信号处理函数使用。
   int signal_pipe[2];
   if (pipe2(signal_pipe, O_NONBLOCK | O_CLOEXEC) < 0) {
@@ -146,7 +209,12 @@ int main(int argc, char* argv[]) {
     WebServer server;
 
     // 配置、触发模式和信号 fd 准备完成后再创建监听 socket。
-    server.init(config);
+    if (!server.init(config)) {
+      g_signal_write_fd = -1;
+      close(signal_pipe[0]);
+      close(signal_pipe[1]);
+      return 1;
+    }
     server.trig_mode();
     server.setSignalFd(signal_pipe[0]);
 

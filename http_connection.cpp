@@ -1,4 +1,5 @@
 #include "http_connection.h"
+#include "user_repository.h"
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -13,6 +14,7 @@
 #include <filesystem>
 #include <limits>
 #include <sstream>
+#include <utility>
 
 namespace {
 constexpr std::size_t kReadChunkSize = 4096;
@@ -32,16 +34,18 @@ bool pathIsWithin(const std::filesystem::path& root,
   }
   return true;
 }
-}  // namespace
+}  // 匿名命名空间
 
-HttpConnection::HttpConnection()
+HttpConnection::HttpConnection(
+    std::shared_ptr<UserRepository> user_repository)
     : parse_state_(ParseState::kRequestLine),
       parse_position_(0),
       content_length_(0),
       bytes_written_(0),
       mapped_file_(nullptr),
       mapped_file_size_(0),
-      keep_alive_(false) {}
+      keep_alive_(false),
+      user_repository_(std::move(user_repository)) {}
 
 HttpConnection::~HttpConnection() {
   releaseMappedFile();
@@ -276,12 +280,30 @@ bool HttpConnection::parseHeader(const std::string& line) {
 
 void HttpConnection::buildResponse() {
   if (method_ == "POST") {
-    std::string content_type = "text/plain; charset=utf-8";
-    auto requested_type = headers_.find("content-type");
-    if (requested_type != headers_.end() && !requested_type->second.empty()) {
-      content_type = requested_type->second;
+    std::string route = target_;
+    std::size_t query = route.find_first_of("?#");
+    if (query != std::string::npos) {
+      route.resize(query);
     }
-    buildMemoryResponse(200, "OK", content_type, body_);
+    if (route == "/register") {
+      handleRegister();
+      return;
+    }
+    if (route == "/login") {
+      handleLogin();
+      return;
+    }
+    if (route == "/echo") {
+      std::string content_type = "text/plain; charset=utf-8";
+      auto requested_type = headers_.find("content-type");
+      if (requested_type != headers_.end() &&
+          !requested_type->second.empty()) {
+        content_type = requested_type->second;
+      }
+      buildMemoryResponse(200, "OK", content_type, body_);
+      return;
+    }
+    buildErrorResponse(404, "Not Found", "未知的 POST 路由。");
     return;
   }
   if (method_ != "GET") {
@@ -314,6 +336,159 @@ void HttpConnection::buildResponse() {
                          "The server could not read the requested file.");
       return;
   }
+}
+
+void HttpConnection::handleRegister() {
+  auto content_type = headers_.find("content-type");
+  if (content_type == headers_.end() ||
+      toLower(content_type->second).find(
+          "application/x-www-form-urlencoded") != 0) {
+    buildMemoryResponse(
+        415, "Unsupported Media Type", "application/json; charset=utf-8",
+        "{\"error\":\"请求类型必须是 "
+        "application/x-www-form-urlencoded\"}\n");
+    return;
+  }
+
+  std::unordered_map<std::string, std::string> fields;
+  if (!parseFormBody(&fields)) {
+    buildMemoryResponse(400, "Bad Request",
+                        "application/json; charset=utf-8",
+                        "{\"error\":\"表单请求体格式错误\"}\n");
+    return;
+  }
+
+  const std::string& username = fields["username"];
+  const std::string& password = fields["password"];
+  if (username.empty() || username.size() > 64 ||
+      password.size() < 8 || password.size() > 1024) {
+    buildMemoryResponse(
+        400, "Bad Request", "application/json; charset=utf-8",
+        "{\"error\":\"用户名长度必须为 1-64 字节，密码长度必须为 "
+        "8-1024 字节\"}\n");
+    return;
+  }
+  if (!user_repository_) {
+    buildMemoryResponse(503, "Service Unavailable",
+                        "application/json; charset=utf-8",
+                        "{\"error\":\"数据库暂不可用\"}\n");
+    return;
+  }
+
+  switch (user_repository_->registerUser(username, password)) {
+    case RegisterResult::kSuccess:
+      buildMemoryResponse(201, "Created",
+                          "application/json; charset=utf-8",
+                          "{\"message\":\"注册成功\"}\n");
+      return;
+    case RegisterResult::kDuplicateUsername:
+      buildMemoryResponse(409, "Conflict",
+                          "application/json; charset=utf-8",
+                          "{\"error\":\"用户名已存在\"}\n");
+      return;
+    case RegisterResult::kUnavailable:
+      buildMemoryResponse(503, "Service Unavailable",
+                          "application/json; charset=utf-8",
+                          "{\"error\":\"数据库暂不可用\"}\n");
+      return;
+    case RegisterResult::kError:
+      buildMemoryResponse(500, "Internal Server Error",
+                          "application/json; charset=utf-8",
+                          "{\"error\":\"注册失败\"}\n");
+      return;
+  }
+}
+
+void HttpConnection::handleLogin() {
+  auto content_type = headers_.find("content-type");
+  if (content_type == headers_.end() ||
+      toLower(content_type->second).find(
+          "application/x-www-form-urlencoded") != 0) {
+    buildMemoryResponse(
+        415, "Unsupported Media Type", "application/json; charset=utf-8",
+        "{\"error\":\"请求类型必须是 "
+        "application/x-www-form-urlencoded\"}\n");
+    return;
+  }
+
+  std::unordered_map<std::string, std::string> fields;
+  if (!parseFormBody(&fields)) {
+    buildMemoryResponse(400, "Bad Request",
+                        "application/json; charset=utf-8",
+                        "{\"error\":\"表单请求体格式错误\"}\n");
+    return;
+  }
+
+  const std::string& username = fields["username"];
+  const std::string& password = fields["password"];
+  if (username.empty() || username.size() > 64 ||
+      password.empty() || password.size() > 1024) {
+    buildMemoryResponse(400, "Bad Request",
+                        "application/json; charset=utf-8",
+                        "{\"error\":\"用户名或密码格式错误\"}\n");
+    return;
+  }
+  if (!user_repository_) {
+    buildMemoryResponse(503, "Service Unavailable",
+                        "application/json; charset=utf-8",
+                        "{\"error\":\"数据库暂不可用\"}\n");
+    return;
+  }
+
+  switch (user_repository_->login(username, password)) {
+    case LoginResult::kSuccess:
+      buildMemoryResponse(200, "OK",
+                          "application/json; charset=utf-8",
+                          "{\"message\":\"登录成功\"}\n");
+      return;
+    case LoginResult::kInvalidCredentials:
+      buildMemoryResponse(
+          401, "Unauthorized", "application/json; charset=utf-8",
+          "{\"error\":\"用户名或密码错误\"}\n");
+      return;
+    case LoginResult::kUnavailable:
+      buildMemoryResponse(503, "Service Unavailable",
+                          "application/json; charset=utf-8",
+                          "{\"error\":\"数据库暂不可用\"}\n");
+      return;
+    case LoginResult::kError:
+      buildMemoryResponse(500, "Internal Server Error",
+                          "application/json; charset=utf-8",
+                          "{\"error\":\"登录失败\"}\n");
+      return;
+  }
+}
+
+bool HttpConnection::parseFormBody(
+    std::unordered_map<std::string, std::string>* fields) const {
+  fields->clear();
+  std::size_t position = 0;
+  while (position <= body_.size()) {
+    std::size_t end = body_.find('&', position);
+    if (end == std::string::npos) {
+      end = body_.size();
+    }
+    std::string pair = body_.substr(position, end - position);
+    std::size_t separator = pair.find('=');
+    if (separator == std::string::npos) {
+      return false;
+    }
+
+    std::string name;
+    std::string value;
+    if (!decodeFormComponent(pair.substr(0, separator), &name) ||
+        !decodeFormComponent(pair.substr(separator + 1), &value) ||
+        name.empty() || fields->find(name) != fields->end()) {
+      return false;
+    }
+    fields->emplace(std::move(name), std::move(value));
+
+    if (end == body_.size()) {
+      break;
+    }
+    position = end + 1;
+  }
+  return true;
 }
 
 void HttpConnection::buildErrorResponse(int status, const std::string& reason,
@@ -483,6 +658,37 @@ std::string HttpConnection::toLower(std::string value) {
   std::transform(value.begin(), value.end(), value.begin(),
                  [](unsigned char ch) { return std::tolower(ch); });
   return value;
+}
+
+bool HttpConnection::decodeFormComponent(const std::string& input,
+                                         std::string* output) {
+  output->clear();
+  for (std::size_t i = 0; i < input.size(); ++i) {
+    if (input[i] == '+') {
+      output->push_back(' ');
+      continue;
+    }
+    if (input[i] != '%') {
+      output->push_back(input[i]);
+      continue;
+    }
+    if (i + 2 >= input.size() ||
+        !std::isxdigit(static_cast<unsigned char>(input[i + 1])) ||
+        !std::isxdigit(static_cast<unsigned char>(input[i + 2]))) {
+      return false;
+    }
+    auto hex = [](unsigned char ch) {
+      return std::isdigit(ch) ? ch - '0' : std::tolower(ch) - 'a' + 10;
+    };
+    char decoded =
+        static_cast<char>((hex(input[i + 1]) << 4) | hex(input[i + 2]));
+    if (decoded == '\0') {
+      return false;
+    }
+    output->push_back(decoded);
+    i += 2;
+  }
+  return true;
 }
 
 std::string HttpConnection::contentTypeForPath(const std::string& path) {

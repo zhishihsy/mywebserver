@@ -2,8 +2,11 @@
 #define HTTP_CONNECTION_H
 
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <unordered_map>
+
+class UserRepository;
 
 class HttpConnection {
  public:
@@ -26,7 +29,8 @@ class HttpConnection {
     kError,
   };
 
-  HttpConnection();
+  explicit HttpConnection(
+      std::shared_ptr<UserRepository> user_repository = nullptr);
   ~HttpConnection();
 
   HttpConnection(const HttpConnection&) = delete;
@@ -62,6 +66,10 @@ class HttpConnection {
   bool parseRequestLine(const std::string& line);
   bool parseHeader(const std::string& line);
   void buildResponse();
+  void handleRegister();
+  void handleLogin();
+  bool parseFormBody(
+      std::unordered_map<std::string, std::string>* fields) const;
   void buildErrorResponse(int status, const std::string& reason,
                           const std::string& message);
   void buildMemoryResponse(int status, const std::string& reason,
@@ -74,6 +82,8 @@ class HttpConnection {
 
   static std::string trim(const std::string& value);
   static std::string toLower(std::string value);
+  static bool decodeFormComponent(const std::string& input,
+                                  std::string* output);
   static std::string contentTypeForPath(const std::string& path);
   static bool decodeUrlPath(const std::string& input, std::string* output);
 
@@ -92,6 +102,7 @@ class HttpConnection {
   std::string body_;
   std::unordered_map<std::string, std::string> headers_;
   bool keep_alive_;
+  std::shared_ptr<UserRepository> user_repository_;
 };
 
 #endif

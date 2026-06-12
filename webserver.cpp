@@ -14,7 +14,7 @@
 namespace {
 constexpr int kMaxEventNumber = 10000;
 constexpr int kListenBacklog = SOMAXCONN;
-}  // namespace
+}  // 匿名命名空间
 
 WebServer::WebServer()
     : port_(8080),
@@ -33,6 +33,9 @@ WebServer::~WebServer() {
   // 先等待工作任务结束，避免线程继续访问随后释放的连接和 epoll。
   if (thread_pool_) {
     thread_pool_->shutdown();
+  }
+  if (database_pool_) {
+    database_pool_->shutdown();
   }
 
   // 先关闭所有客户端，再释放监听 socket 和 epoll。
@@ -57,7 +60,7 @@ WebServer::~WebServer() {
   }
 }
 
-void WebServer::init(const ServerConfig& config) {
+bool WebServer::init(const ServerConfig& config) {
   port_ = config.port;
   trig_mode_ = config.trigger_mode;
   linger_option_ = config.linger;
@@ -66,8 +69,19 @@ void WebServer::init(const ServerConfig& config) {
   idle_timeout_ =
       std::chrono::seconds(std::max(1, config.idle_timeout_seconds));
 
-  // Proactor 在线程池中处理业务；Reactor 在线程池中处理整个连接事件。
+  database_pool_ = std::make_shared<MysqlConnectionPool>();
+  std::string database_error;
+  if (!database_pool_->initialize(config.database, &database_error)) {
+    std::cerr << "错误：数据库初始化失败："
+              << database_error << '\n';
+    return false;
+  }
+  user_repository_ =
+      std::make_shared<UserRepository>(database_pool_);
+
+  // 先初始化数据库客户端库和连接，再启动工作线程。
   thread_pool_ = std::make_unique<ThreadPool>(thread_count_);
+  return true;
 }
 
 void WebServer::setSignalFd(int signal_fd) {
@@ -173,6 +187,11 @@ void WebServer::eventLoop() {
             << (actor_model_ == 0 ? "Proactor" : "Reactor")
             << std::endl;
   std::cout << " > Worker Threads: " << thread_count_ << std::endl;
+  std::cout << " > MySQL: "
+            << (database_pool_ && database_pool_->isReady()
+                    ? "已启用"
+                    : "未启用")
+            << std::endl;
 
   bool running = true;
   while (running) {
@@ -246,7 +265,8 @@ bool WebServer::acceptConnectionLT() {
     setsockopt(client_fd, SOL_SOCKET, SO_LINGER, &option, sizeof(option));
   }
 
-  ClientPtr client = std::make_shared<ClientData>();
+  ClientPtr client =
+      std::make_shared<ClientData>(user_repository_);
   client->address = client_address;
   client->sockfd = client_fd;
   {
@@ -287,7 +307,8 @@ bool WebServer::acceptConnectionET() {
                  sizeof(option));
     }
 
-    ClientPtr client = std::make_shared<ClientData>();
+    ClientPtr client =
+        std::make_shared<ClientData>(user_repository_);
     client->address = client_address;
     client->sockfd = client_fd;
     {

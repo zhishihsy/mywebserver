@@ -2,7 +2,9 @@
 #define WEBSERVER_H
 
 #include "http_connection.h"
+#include "mysql_connection_pool.h"
 #include "thread_pool.h"
+#include "user_repository.h"
 
 #include <netinet/in.h>
 
@@ -14,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <utility>
 #include <vector>
 
 // 服务器启动配置，由 main 解析命令行后统一传入。
@@ -24,6 +27,7 @@ struct ServerConfig {
   std::size_t thread_count = 8;       // 业务/事件工作线程数。
   int actor_model = 0;                // 0=Proactor，1=Reactor。
   int idle_timeout_seconds = 60;      // 空闲连接超时时间。
+  DatabaseConfig database;
 };
 
 class WebServer {
@@ -32,7 +36,7 @@ class WebServer {
   ~WebServer();
 
   // 保存配置并按并发模型创建所需线程池。
-  void init(const ServerConfig& config);
+  bool init(const ServerConfig& config);
 
   // signal_fd 由 main 持有，服务器仅将其注册到 epoll，不负责关闭。
   void setSignalFd(int signal_fd);
@@ -48,6 +52,9 @@ class WebServer {
 
  private:
   struct ClientData {
+    explicit ClientData(std::shared_ptr<UserRepository> repository)
+        : connection(std::move(repository)) {}
+
     sockaddr_in address{};
     int sockfd{-1};
     HttpConnection connection;
@@ -120,6 +127,8 @@ class WebServer {
 
   // 两种模型都使用线程池，区别在于网络 I/O 由哪一层执行。
   std::unique_ptr<ThreadPool> thread_pool_;
+  std::shared_ptr<MysqlConnectionPool> database_pool_;
+  std::shared_ptr<UserRepository> user_repository_;
   std::mutex clients_mutex_;
   std::map<int, ClientPtr> clients_;
 
