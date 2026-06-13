@@ -72,6 +72,7 @@ bool WebServer::init(const ServerConfig& config) {
   database_pool_ = std::make_shared<MysqlConnectionPool>();
   std::string database_error;
   if (!database_pool_->initialize(config.database, &database_error)) {
+    LOG_ERROR("Database initialization failed: ", database_error);
     std::cerr << "错误：数据库初始化失败："
               << database_error << '\n';
     return false;
@@ -112,6 +113,8 @@ void WebServer::trig_mode() {
       connect_trig_mode_ = 1;
       break;
     default:
+      LOG_WARN("Invalid trigger mode ", trig_mode_,
+               ", falling back to LT + LT");
       std::cerr << "Invalid trigger mode, using LT + LT" << std::endl;
       trig_mode_ = 0;
       listen_trig_mode_ = 0;
@@ -124,6 +127,7 @@ bool WebServer::eventListen() {
   // 创建 TCP 监听 socket。
   listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
   if (listen_fd_ < 0) {
+    LOG_ERROR("Failed to create listen socket, errno=", errno);
     std::cerr << "Error: failed to create listen socket" << std::endl;
     return false;
   }
@@ -132,6 +136,7 @@ bool WebServer::eventListen() {
   int reuse_address = 1;
   if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse_address,
                  sizeof(reuse_address)) < 0) {
+    LOG_WARN("SO_REUSEADDR failed, errno=", errno);
     std::cerr << "Warning: SO_REUSEADDR failed" << std::endl;
   }
 
@@ -139,6 +144,7 @@ bool WebServer::eventListen() {
   linger linger_option{linger_option_, 1};
   if (setsockopt(listen_fd_, SOL_SOCKET, SO_LINGER, &linger_option,
                  sizeof(linger_option)) < 0) {
+    LOG_WARN("SO_LINGER failed, errno=", errno);
     std::cerr << "Warning: SO_LINGER failed" << std::endl;
   }
 
@@ -149,17 +155,20 @@ bool WebServer::eventListen() {
 
   if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&server_address),
            sizeof(server_address)) < 0) {
+    LOG_ERROR("Bind failed on port ", port_, ", errno=", errno);
     std::cerr << "Error: bind failed" << std::endl;
     return false;
   }
 
   if (listen(listen_fd_, kListenBacklog) < 0) {
+    LOG_ERROR("Listen failed, errno=", errno);
     std::cerr << "Error: listen failed" << std::endl;
     return false;
   }
 
   epoll_fd_ = epoll_create1(0);
   if (epoll_fd_ < 0) {
+    LOG_ERROR("epoll_create1 failed, errno=", errno);
     std::cerr << "Error: epoll_create1 failed" << std::endl;
     return false;
   }
@@ -176,6 +185,16 @@ bool WebServer::eventListen() {
 void WebServer::eventLoop() {
   epoll_event events[kMaxEventNumber];
 
+  LOG_INFO("Server running on port ", port_,
+           ", listen_mode=", listen_trig_mode_ ? "ET" : "LT",
+           ", connect_mode=", connect_trig_mode_ ? "ET" : "LT",
+           ", idle_timeout_seconds=", idle_timeout_.count() / 1000,
+           ", actor_model=", actor_model_ == 0 ? "Proactor" : "Reactor",
+           ", worker_threads=", thread_count_,
+           ", mysql=",
+           database_pool_ && database_pool_->isReady()
+               ? "enabled"
+               : "disabled");
   std::cout << "Server running on port " << port_ << std::endl;
   std::cout << " > Listen Mode: "
             << (listen_trig_mode_ ? "ET" : "LT") << std::endl;
@@ -207,6 +226,7 @@ void WebServer::eventLoop() {
         continue;
       }
 
+      LOG_ERROR("epoll_wait failed, errno=", errno);
       std::cerr << "Error: epoll_wait failed" << std::endl;
       break;
     }
@@ -228,6 +248,7 @@ void WebServer::eventLoop() {
       } else {
         ClientPtr client = findClient(sockfd);
         if (client && !dispatchClientEvent(client, event)) {
+          LOG_WARN("Worker queue is full, closing fd=", sockfd);
           std::cerr << "Warning: worker queue is full, closing fd: "
                     << sockfd << std::endl;
           closeClient(client);
@@ -236,6 +257,7 @@ void WebServer::eventLoop() {
     }
   }
 
+  LOG_INFO("Server stopping gracefully");
   std::cout << "Server stopping gracefully" << std::endl;
 }
 
@@ -256,6 +278,7 @@ bool WebServer::acceptConnectionLT() {
       accept(listen_fd_, reinterpret_cast<sockaddr*>(&client_address),
              &client_length);
   if (client_fd < 0) {
+    LOG_ERROR("accept failed in LT mode, errno=", errno);
     std::cerr << "Error: accept failed, errno: " << errno << std::endl;
     return false;
   }
@@ -278,6 +301,7 @@ bool WebServer::acceptConnectionLT() {
   addFd(epoll_fd_, client_fd, true, connect_trig_mode_);
   refreshTimer(client);
 
+  LOG_DEBUG("Accepted connection fd=", client_fd);
   std::cout << "New connection (fd: " << client_fd << ")" << std::endl;
   return true;
 }
@@ -297,6 +321,7 @@ bool WebServer::acceptConnectionET() {
         return true;
       }
 
+      LOG_ERROR("accept failed in ET mode, errno=", errno);
       std::cerr << "Error: accept failed, errno: " << errno << std::endl;
       return false;
     }
@@ -318,6 +343,7 @@ bool WebServer::acceptConnectionET() {
     addFd(epoll_fd_, client_fd, true, connect_trig_mode_);
     refreshTimer(client);
 
+    LOG_DEBUG("Accepted connection fd=", client_fd);
     std::cout << "New connection (fd: " << client_fd << ")"
               << std::endl;
   }
@@ -413,6 +439,8 @@ void WebServer::handleClientEvent(const ClientPtr& client,
   } else if (event & EPOLLOUT) {
     action = dealwithwrite(client);
   } else if (event & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
+    LOG_DEBUG("Connection event requested close, fd=", client->sockfd,
+              ", events=", event);
     std::cout << "Connection closed (fd: " << client->sockfd << ")"
               << std::endl;
   }
@@ -528,6 +556,7 @@ void WebServer::expireIdleConnections() {
   }
 
   for (const ClientPtr& client : expired_clients) {
+    LOG_INFO("Idle connection timed out, fd=", client->sockfd);
     std::cout << "Idle connection timed out (fd: " << client->sockfd
               << ")" << std::endl;
     closeClient(client);
@@ -574,6 +603,7 @@ void WebServer::closeClient(const ClientPtr& client) {
   }
 
   removeFd(epoll_fd_, client->sockfd);
+  LOG_DEBUG("Closed connection fd=", client->sockfd);
 }
 
 int WebServer::setNonblocking(int fd) {

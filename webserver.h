@@ -2,6 +2,7 @@
 #define WEBSERVER_H
 
 #include "http_connection.h"
+#include "logger.h"
 #include "mysql_connection_pool.h"
 #include "thread_pool.h"
 #include "user_repository.h"
@@ -27,6 +28,7 @@ struct ServerConfig {
   std::size_t thread_count = 8;       // 业务/事件工作线程数。
   int actor_model = 0;                // 0=Proactor，1=Reactor。
   int idle_timeout_seconds = 60;      // 空闲连接超时时间。
+  LogConfig log;
   DatabaseConfig database;
 };
 

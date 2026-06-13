@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cctype>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -96,6 +97,82 @@ bool loadDatabaseConfig(ServerConfig* config, std::string* error) {
   }
   return true;
 }
+
+bool parseBooleanEnvironment(const char* name, bool default_value,
+                             bool* value, std::string* error) {
+  const char* text = std::getenv(name);
+  if (!text) {
+    *value = default_value;
+    return true;
+  }
+  if (std::string(text) == "0") {
+    *value = false;
+    return true;
+  }
+  if (std::string(text) == "1") {
+    *value = true;
+    return true;
+  }
+  *error = std::string(name) + " must be 0 or 1";
+  return false;
+}
+
+bool loadLogConfig(ServerConfig* config, std::string* error) {
+  if (!parseBooleanEnvironment("LOG_ENABLED", true,
+                               &config->log.enabled, error) ||
+      !parseBooleanEnvironment("LOG_ASYNC", false,
+                               &config->log.asynchronous, error)) {
+    return false;
+  }
+
+  if (const char* value = std::getenv("LOG_FILE")) {
+    config->log.file = value;
+  }
+
+  if (const char* value = std::getenv("LOG_LEVEL")) {
+    std::string level(value);
+    for (char& character : level) {
+      character = static_cast<char>(
+          std::toupper(static_cast<unsigned char>(character)));
+    }
+    if (level == "DEBUG") {
+      config->log.level = LogLevel::kDebug;
+    } else if (level == "INFO") {
+      config->log.level = LogLevel::kInfo;
+    } else if (level == "WARN") {
+      config->log.level = LogLevel::kWarn;
+    } else if (level == "ERROR") {
+      config->log.level = LogLevel::kError;
+    } else {
+      *error = "LOG_LEVEL must be DEBUG, INFO, WARN, or ERROR";
+      return false;
+    }
+  }
+
+  int parsed = 0;
+  if (const char* value = std::getenv("LOG_QUEUE_SIZE")) {
+    if (!parseInteger(value, 1, 1000000, &parsed)) {
+      *error = "LOG_QUEUE_SIZE must be in the range 1-1000000";
+      return false;
+    }
+    config->log.queue_size = static_cast<std::size_t>(parsed);
+  }
+  if (const char* value = std::getenv("LOG_MAX_LINES")) {
+    if (!parseInteger(value, 1, 1000000000, &parsed)) {
+      *error = "LOG_MAX_LINES must be in the range 1-1000000000";
+      return false;
+    }
+    config->log.max_lines = static_cast<std::size_t>(parsed);
+  }
+  return true;
+}
+
+class LoggerGuard {
+ public:
+  ~LoggerGuard() {
+    Logger::instance().shutdown();
+  }
+};
 
 void printUsage(const char* program) {
   std::cout
@@ -190,15 +267,33 @@ int main(int argc, char* argv[]) {
     return 2;
   }
 
+  std::string log_error;
+  if (!loadLogConfig(&config, &log_error)) {
+    std::cerr << "Invalid log configuration: " << log_error << '\n';
+    return 2;
+  }
+  if (!Logger::instance().initialize(config.log, &log_error)) {
+    std::cerr << "Failed to initialize logger: " << log_error << '\n';
+    return 1;
+  }
+  LoggerGuard logger_guard;
+  LOG_INFO("Logger initialized: mode=",
+           config.log.asynchronous ? "async" : "sync",
+           ", level=", static_cast<int>(config.log.level),
+           ", file=", config.log.file,
+           ", max_lines=", config.log.max_lines);
+
   // 管道读端交给 epoll，写端只由信号处理函数使用。
   int signal_pipe[2];
   if (pipe2(signal_pipe, O_NONBLOCK | O_CLOEXEC) < 0) {
+    LOG_ERROR("Failed to create signal pipe, errno=", errno);
     std::cerr << "Error: failed to create signal pipe\n";
     return 1;
   }
 
   g_signal_write_fd = signal_pipe[1];
   if (!installSignalHandlers()) {
+    LOG_ERROR("Failed to install signal handlers, errno=", errno);
     std::cerr << "Error: failed to install signal handlers\n";
     close(signal_pipe[0]);
     close(signal_pipe[1]);

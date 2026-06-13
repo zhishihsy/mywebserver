@@ -77,7 +77,7 @@ def wait_until_ready(process, port):
 def main():
     if os.environ.get("MYSQL_ENABLED") != "1":
         raise SystemExit(
-            "运行阶段 4 测试前，请设置 MYSQL_ENABLED=1 和 MYSQL_USER"
+            "运行 MySQL 集成测试前，请设置 MYSQL_ENABLED=1 和 MYSQL_USER"
         )
 
     port = reserve_port()
@@ -90,7 +90,7 @@ def main():
         stderr=log,
     )
 
-    username = "phase4_" + secrets.token_hex(8)
+    username = "mysql_test_" + secrets.token_hex(8)
     password = "test-password-" + secrets.token_hex(8)
     credentials = {"username": username, "password": password}
 
@@ -138,7 +138,7 @@ def main():
     output = log.read().decode(errors="replace")
     log.close()
     assert "MySQL: 已启用" in output, output
-    print("阶段 4 MySQL 测试通过")
+    print("MySQL 集成测试通过")
 
 
 if __name__ == "__main__":

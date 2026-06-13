@@ -1,5 +1,7 @@
 # Build artifacts
 /webserver
+/tests/logger_unit_test
+/tests/logger_unit_test.exe
 
 # Runtime logs
 *.log

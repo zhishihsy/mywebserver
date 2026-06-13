@@ -66,12 +66,12 @@ def assert_status(port, raw_request, expected):
 def main():
     resources = ROOT / "resources"
     fixtures = {
-        "phase2-image.png": b"\x89PNG\r\n\x1a\n" + os.urandom(32 * 1024),
-        "phase2-video.mp4": b"\x00\x00\x00\x18ftypmp42" + os.urandom(512 * 1024),
-        "phase2-large.bin": os.urandom(8 * 1024 * 1024),
+        "test-image.png": b"\x89PNG\r\n\x1a\n" + os.urandom(32 * 1024),
+        "test-video.mp4": b"\x00\x00\x00\x18ftypmp42" + os.urandom(512 * 1024),
+        "test-large.bin": os.urandom(8 * 1024 * 1024),
     }
-    forbidden = resources / "phase2-forbidden.txt"
-    internal_error = resources / "phase2-internal-error.sock"
+    forbidden = resources / "test-forbidden.txt"
+    internal_error = resources / "test-internal-error.sock"
     internal_error_socket = None
     process = None
     log = None
@@ -99,7 +99,7 @@ def main():
         )
         wait_until_ready(process, port)
 
-        post_body = b'{"phase":2,"method":"POST"}'
+        post_body = b'{"test":"http","method":"POST"}'
         status, headers, body = request(
             port,
             b"POST /echo HTTP/1.1\r\nHost: localhost\r\n"
@@ -126,7 +126,7 @@ def main():
         )
         assert_status(
             port,
-            b"GET /phase2-forbidden.txt HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            b"GET /test-forbidden.txt HTTP/1.1\r\nHost: localhost\r\n\r\n",
             403,
         )
         assert_status(
@@ -146,7 +146,7 @@ def main():
         )
         assert_status(
             port,
-            b"GET /phase2-internal-error.sock HTTP/1.1\r\n"
+            b"GET /test-internal-error.sock HTTP/1.1\r\n"
             b"Host: localhost\r\n\r\n",
             500,
         )
@@ -163,7 +163,7 @@ def main():
             b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n"
             b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\n"
             b"pipe"
-            b"GET /phase2-image.png HTTP/1.1\r\nHost: localhost\r\n"
+            b"GET /test-image.png HTTP/1.1\r\nHost: localhost\r\n"
             b"Connection: close\r\n\r\n"
         )
         with socket.create_connection((HOST, port), timeout=5) as connection:
@@ -174,10 +174,10 @@ def main():
             third = receive_response(connection, second[3])
             assert first[0] == 200 and first[2] == b"OK\n"
             assert second[0] == 200 and second[2] == b"pipe"
-            assert third[0] == 200 and third[2] == fixtures["phase2-image.png"]
+            assert third[0] == 200 and third[2] == fixtures["test-image.png"]
             assert third[1][b"connection"] == b"close"
 
-        print("phase 2 HTTP tests passed")
+        print("HTTP protocol tests passed")
     finally:
         if process is not None:
             process.send_signal(signal.SIGTERM)

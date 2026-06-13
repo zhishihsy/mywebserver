@@ -1,5 +1,7 @@
 #include "user_repository.h"
 
+#include "logger.h"
+
 #ifdef ENABLE_MYSQL
 #include <mysql/mysql.h>
 #include <openssl/crypto.h>
@@ -141,6 +143,9 @@ void bindString(MYSQL_BIND* binding, const std::string& value,
 }
 
 void logStatementError(const char* operation, MYSQL_STMT* statement) {
+  LOG_ERROR("Database operation ", operation, " failed, code=",
+            mysql_stmt_errno(statement), ", message=",
+            mysql_stmt_error(statement));
   std::cerr << "数据库操作“" << operation << "”失败，错误码："
             << mysql_stmt_errno(statement) << "，错误信息："
             << mysql_stmt_error(statement) << '\n';
@@ -165,6 +170,7 @@ RegisterResult UserRepository::registerUser(
 
   std::string password_hash;
   if (!hashPassword(password, &password_hash)) {
+    LOG_ERROR("Password hashing failed");
     std::cerr << "密码哈希计算失败\n";
     return RegisterResult::kError;
   }

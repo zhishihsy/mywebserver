@@ -66,7 +66,7 @@ def wait_until_ready(process, port):
 
 
 def check_fragmented_request(port):
-    body = b"fragmented-phase-3"
+    body = b"fragmented-request"
     headers = (
         b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: "
         + str(len(body)).encode()
@@ -158,7 +158,7 @@ def main():
     for actor_model in (0, 1):
         for trigger_mode in range(4):
             run_combination(actor_model, trigger_mode)
-    print("phase 3 concurrency tests passed (2 actor models x 4 trigger modes)")
+    print("concurrency tests passed (2 actor models x 4 trigger modes)")
 
 
 if __name__ == "__main__":
