@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: make build
+
+      - name: HTTP protocol tests
+        run: make test-http
+
+      - name: Concurrency matrix
+        run: make test-concurrency
+
+      - name: Stability tests
+        run: make test-stability
+
+      - name: Logging tests
+        run: make test-logging
+
+      - name: Address and undefined behavior sanitizers
+        run: |
+          make clean
+          make sanitizer
+          ASAN_OPTIONS=detect_leaks=1 python3 tests/http_protocol_test.py
+
+  mysql:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -proot"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MySQL build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y default-libmysqlclient-dev \
+            default-mysql-client libssl-dev pkg-config
+
+      - name: Initialize database
+        run: mysql -h127.0.0.1 -uroot -proot < sql/init.sql
+
+      - name: MySQL integration tests
+        env:
+          MYSQL_ENABLED: "1"
+          MYSQL_HOST: 127.0.0.1
+          MYSQL_PORT: "3306"
+          MYSQL_USER: root
+          MYSQL_PASSWORD: root
+          MYSQL_DATABASE: mywebserver
+          MYSQL_POOL_SIZE: "8"
+        run: make test-mysql

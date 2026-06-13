@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>用户注册与登录</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      min-height: 100vh;
+      margin: 0;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      color: #e8edf5;
+      background: radial-gradient(circle at top, #203458 0, transparent 42%),
+                  #0b1020;
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    main {
+      width: min(100%, 760px);
+      padding: 36px;
+      border: 1px solid #334365;
+      border-radius: 20px;
+      background: rgba(19, 28, 49, 0.92);
+      box-shadow: 0 24px 70px rgba(0, 0, 0, 0.35);
+    }
+    h1 { margin-top: 12px; }
+    .forms {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 20px;
+    }
+    form {
+      display: grid;
+      gap: 12px;
+      padding: 20px;
+      border: 1px solid #334365;
+      border-radius: 14px;
+      background: #111a2d;
+    }
+    label {
+      display: grid;
+      gap: 6px;
+      color: #b8c5da;
+    }
+    input, button {
+      width: 100%;
+      padding: 11px 12px;
+      border: 1px solid #42577e;
+      border-radius: 9px;
+      font: inherit;
+    }
+    input {
+      color: #eef4ff;
+      background: #0a1222;
+    }
+    button {
+      color: #08111f;
+      background: #70a7ff;
+      border: 0;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    output {
+      display: block;
+      min-height: 52px;
+      margin-top: 20px;
+      padding: 14px;
+      border-radius: 10px;
+      color: #bdd4ff;
+      background: #0a1222;
+      white-space: pre-wrap;
+    }
+    a { color: #94bdff; }
+  </style>
+</head>
+<body>
+  <main>
+    <a href="/">返回首页</a>
+    <h1>用户注册与登录</h1>
+    <p>需要使用 <code>make mysql</code> 构建并启用数据库配置。</p>
+    <div class="forms">
+      <form data-endpoint="/register">
+        <h2>注册</h2>
+        <label>
+          用户名
+          <input name="username" minlength="3" maxlength="64" required>
+        </label>
+        <label>
+          密码
+          <input name="password" type="password" minlength="8"
+                 maxlength="128" required>
+        </label>
+        <button type="submit">创建账户</button>
+      </form>
+      <form data-endpoint="/login">
+        <h2>登录</h2>
+        <label>
+          用户名
+          <input name="username" minlength="3" maxlength="64" required>
+        </label>
+        <label>
+          密码
+          <input name="password" type="password" minlength="8"
+                 maxlength="128" required>
+        </label>
+        <button type="submit">登录</button>
+      </form>
+    </div>
+    <output id="result">等待操作</output>
+  </main>
+  <script>
+    const result = document.querySelector("#result");
+    for (const form of document.querySelectorAll("form")) {
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        result.textContent = "请求处理中...";
+        try {
+          const response = await fetch(form.dataset.endpoint, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded",
+            },
+            body: new URLSearchParams(new FormData(form)),
+          });
+          result.textContent =
+            `${response.status} ${response.statusText}\n`
+            + await response.text();
+        } catch (error) {
+          result.textContent = `请求失败：${error.message}`;
+        }
+      });
+    }
+  </script>
+</body>
+</html>

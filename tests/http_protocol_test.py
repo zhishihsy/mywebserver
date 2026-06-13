@@ -65,6 +65,7 @@ def assert_status(port, raw_request, expected):
 
 def main():
     resources = ROOT / "resources"
+    account_page = (resources / "account.html").read_bytes()
     fixtures = {
         "test-image.png": b"\x89PNG\r\n\x1a\n" + os.urandom(32 * 1024),
         "test-video.mp4": b"\x00\x00\x00\x18ftypmp42" + os.urandom(512 * 1024),
@@ -98,6 +99,14 @@ def main():
             stderr=log,
         )
         wait_until_ready(process, port)
+
+        status, headers, body = request(
+            port,
+            b"GET /account.html HTTP/1.1\r\n"
+            b"Host: localhost\r\nConnection: close\r\n\r\n",
+        )
+        assert status == 200 and body == account_page
+        assert headers[b"content-type"].startswith(b"text/html")
 
         post_body = b'{"test":"http","method":"POST"}'
         status, headers, body = request(

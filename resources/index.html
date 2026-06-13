@@ -61,6 +61,12 @@
       line-height: 1.7;
     }
 
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+
     a {
       display: inline-block;
       padding: 12px 18px;
@@ -88,7 +94,10 @@
       你的 C++ Web 服务器已经成功返回静态页面。
       可以访问 <code>/health</code> 检查服务状态。
     </p>
-    <a href="/health">检查服务状态</a>
+    <div class="actions">
+      <a href="/health">检查服务状态</a>
+      <a href="/account.html">注册与登录</a>
+    </div>
   </main>
 </body>
 </html>

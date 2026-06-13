@@ -142,7 +142,9 @@ bool Logger::writeLine(const std::string& line) {
   }
 
   output_ << line;
-  output_.flush();
+  if (!config_.asynchronous) {
+    output_.flush();
+  }
   if (!output_) {
     std::cerr << "Failed to write log file\n";
     return false;

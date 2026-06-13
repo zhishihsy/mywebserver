@@ -183,6 +183,7 @@ void printUsage(const char* program) {
       << "  -o 0|1      Enable SO_LINGER (default: 0)\n"
       << "  -t THREADS  Worker threads (1-1024, default: 8)\n"
       << "  -a MODEL    0=Proactor, 1=Reactor (default: 0)\n"
+      << "  -i SECONDS  Idle connection timeout (1-3600, default: 60)\n"
       << "  -h          Show this help\n";
 }
 
@@ -211,7 +212,7 @@ int main(int argc, char* argv[]) {
 
   // 解析启动参数，并在进入服务器初始化前完成全部范围校验。
   int option = 0;
-  while ((option = getopt(argc, argv, "p:m:o:t:a:h")) != -1) {
+  while ((option = getopt(argc, argv, "p:m:o:t:a:i:h")) != -1) {
     int value = 0;
     switch (option) {
       case 'p':
@@ -242,6 +243,13 @@ int main(int argc, char* argv[]) {
       case 'a':
         if (!parseInteger(optarg, 0, 1, &config.actor_model)) {
           std::cerr << "Invalid actor model: " << optarg << '\n';
+          return 2;
+        }
+        break;
+      case 'i':
+        if (!parseInteger(optarg, 1, 3600,
+                          &config.idle_timeout_seconds)) {
+          std::cerr << "Invalid idle timeout: " << optarg << '\n';
           return 2;
         }
         break;
